@@ -1,0 +1,7 @@
+boto3==1.35.31
+more_itertools
+questionary
+tyro
+natsort
+rich
+treelib
