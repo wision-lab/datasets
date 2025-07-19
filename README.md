@@ -2,29 +2,31 @@
 
 Our datasets are hosted on a publicly accessible S3 bucket. You can use the [aws-cli](https://docs.aws.amazon.com/cli/latest/userguide/cli-chap-getting-started.html) to download individual objects or the whole dataset.
 
-Here's an example script which will download and unzip the whole `quanta-vision/sequences` dataset (warning ~2.4TB):
+You can list all datasets and parts thereof like so:
+```
+aws s3 ls --summarize --human-readable --recursive s3://public-datasets/ --endpoint=https://web.s3.wisc.edu --no-sign-request
+```
 
+To only list data accosiated with a single dataset replace the URI above with one that matches the dataset prefix, e.g by using `s3://public-datasets/quanta-vision/sequences`.  
+
+To download a specific object (where object-key is eg quanta-vision/sequences/README.md) you can use the following command:
+```
+aws s3api get-object --bucket public-datasets --key <OBJECT-KEY> --endpoint=https://web.s3.wisc.edu --no-sign-request <DOWNLOAD-PATH>
+```
+
+Finally, here's an example script which will download and unzip the whole `quanta-vision/sequences` dataset (warning ~2.4TB). You can use the same script with a different `DATASET_PREFIX` to download other datasets or subparts thereof:
 ```
 #!/usr/bin/env bash
 
 # Directory to download data to
 DOWNLOAD_DIR=downloads/
-DATASET_TAG=quanta-vision/sequences
+DATASET_PREFIX=quanta-vision/sequences
 
 # Clone all data from S3
-aws s3 sync s3://public-datasets/$DATASET_TAG $DOWNLOAD_DIR --endpoint=https://web.s3.wisc.edu --no-sign-request
+aws s3 sync s3://public-datasets/$DATASET_PREFIX $DOWNLOAD_DIR --endpoint=https://web.s3.wisc.edu --no-sign-request
 
 # Extract all zips in their CWD
 for zip in $(find $DOWNLOAD_DIR -type f -name *.zip); do unzip $zip -d $(dirname $zip) && rm -f $zip; done
-```
-
-A few useful commands are as follows:
-```
-# To list all parts of the dataset you can run:
-aws s3 ls --summarize --human-readable --recursive s3://public-datasets/quanta-vision/sequences --endpoint=https://web.s3.wisc.edu --no-sign-request
-
-# To download a specific object (where object-key is eg quanta-vision/sequences/README.md)
-aws s3api get-object --bucket public-datasets --key <OBJECT-KEY> --endpoint=https://web.s3.wisc.edu --no-sign-request <DOWNLOAD-PATH>
 ```
 
 *Note:* If you are on UW-Madison wifi, downloads will be much faster.
@@ -32,7 +34,7 @@ aws s3api get-object --bucket public-datasets --key <OBJECT-KEY> --endpoint=http
 
 ## Quanta Vision Sequences
 
-Below we include folder-wise descriptions (of directories under `sequences`), paper(s) associated with the folder and hot-pixel masks per sequence.
+Below we include folder-wise descriptions (of directories under `sequences`), paper(s) associated with the folder and hot-pixel masks per sequence. These real-world sequences were captured using the passive single photon cameras, high speed cameras, or other specialized cameras (event/low light cameras).
 
 * `anycam`: sequences associated with [Sundar et al., ICCV 2023](https://openaccess.thecvf.com/content/ICCV2023/html/Sundar_SoDaCam_Software-defined_Cameras_via_Single-Photon_Imaging_ICCV_2023_paper.html).  All sequences were captured at 96.8 kHz. Associated hot-pixel mask is `hot_pixel_mask/SwissSPAD_ddr3_mode.npy` for sequences captured by the SPAD with no color filter array and `hot_pixel_mask/colorSPAD_continuous_stream.npy` for the rest.  See `arguments.json` in each folder that contains a `binary.npy` file for discerning which is which. Alternatively, the mean-frame video gives it away (ones that use a CFA have a conspicuous mosaic pattern). When using the color-filter array captured sequences, we impute out the pixels corresponding to "R", "G", and "B" filters; these are a minority and make up just 6.25% of the overall pixel count.
 * `color`: sequences associated with [Ma et al., SIGGRAPH 2023](https://dl.acm.org/doi/10.1145/3592438). Sequences were captured at 16 kHz (unless annotated otherwise) and use the hotpixel mask in `hot_pixel_mask/colorSPAD_continuous_stream.npy`. See `color_filter_array/rgbw_oh_bn_color_ss2_padded.tif` for a specification of the random RGBW CFA pattern.
@@ -79,6 +81,36 @@ ROOT: quanta_vision/sequences
 │   ├── (ZIP #11/12 108.1G) 1007-walk-1, 1007-walk-2, 1007-walk-3, 1014-slam-l0, 1014-slam-l0-2, 1014-slam-l0-3, 1014-slam-l0-4, 1014-slam-l0-5, 1014-slam-l1
 │   └── (ZIP #12/12 49.6G) 1014-slam-l2, 1014-slam-l2-2, 1014-slam-l3, 1014-slam-l4
 └── 📄 README.md
+```
+
+*Note:* The zip file sizes refer to the decompressed filesize.
+
+</details>
+
+
+## VisionSIM-50 Dataset (pre-release) 
+
+Using the [visionsim framework](https://github.com/WISION-Lab/visionsim) you can simulate large scale datasets with a wide range of ground truth annotations and realistic sensor emulations. Here we provide access to the [dataset which was created as part of this tutorial.](https://visionsim.readthedocs.io/en/latest/tutorials/large-dataset.html) It contains 50 indoor scenes with realistic camera motion which are animated for 12 seconds and rendered at `100fps` at a resolution of `800x800` pixels. Ground truth annotation for metric depths, normals, optical flow (both forward and backwards), object segmentations, as well as camera intrinsics and extrinsics are provided for every frame.
+
+*Note:* This is a pre-release dataset and is subject to change or get updated. 
+
+<details>
+<summary>See Detailed Folder Structure</summary>
+
+```
+ROOT: visionsim/visionsim50-1seq-100fps
+├── (ZIP 6.5G) 📁 previews
+└── 📁 renders
+    ├── (ZIP #1/10 78.7G) attic, bachelors-quarters, barbershop, bath
+    ├── (ZIP #2/10 118.6G) bathroom1, bathroom2, bathroom3, bathroom4, bathroom5, bathtime
+    ├── (ZIP #3/10 73.9G) bedroom1, bedroom2, classroom, cocina-ii
+    ├── (ZIP #4/10 113.5G) country-kitchen, cozykitchen, designer-bedroom, diner, diningroom
+    ├── (ZIP #5/10 101.0G) domestic-office-table, gaffer, game-room, interior-scene, italianflat
+    ├── (ZIP #6/10 96.3G) junkshop, kitchen1, kitchen2, kitchen3, kitchenpack, lazienka
+    ├── (ZIP #7/10 102.0G) library-homeoffice, livingroom, loft, lynxsdesign, mesa-concept, minimarket
+    ├── (ZIP #8/10 115.8G) modern-kitchen, morning-apartment, officebuilding, paneled-room-revisited, restaurant, restroom
+    ├── (ZIP #9/10 98.7G) simplekitchen, staircase, stone-shower, sunny-room, tv-couch, ultramodern
+    └── (ZIP #10/10 44.4G) white-room, wooden-staircase
 ```
 
 *Note:* The zip file sizes refer to the decompressed filesize.
