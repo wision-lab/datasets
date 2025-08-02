@@ -7,7 +7,7 @@ You can list all datasets and parts thereof like so:
 aws s3 ls --summarize --human-readable --recursive s3://public-datasets/ --endpoint=https://web.s3.wisc.edu --no-sign-request
 ```
 
-To only list data accosiated with a single dataset replace the URI above with one that matches the dataset prefix, e.g by using `s3://public-datasets/quanta-vision/sequences`.  
+To only list data associated with a single dataset replace the URI above with one that matches the dataset prefix, e.g by using `s3://public-datasets/quanta-vision/sequences`.  
 
 To download a specific object (where object-key is eg quanta-vision/sequences/README.md) you can use the following command:
 ```
