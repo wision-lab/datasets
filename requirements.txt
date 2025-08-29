@@ -5,3 +5,4 @@ tyro
 natsort
 rich
 treelib
+types-boto3[s3]
