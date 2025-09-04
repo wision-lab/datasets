@@ -7,33 +7,53 @@
 
 from __future__ import annotations
 
-import copy
-import functools
+import contextlib
 import io
 import itertools
 import logging
 import os
 import re
-from dataclasses import dataclass, field
+import shutil
+import sys
+import tempfile
+import zipfile
+from dataclasses import dataclass
 from fnmatch import fnmatch
+from functools import partial, reduce
 from pathlib import Path
-import textwrap
 
 import boto3
 import more_itertools as mitertools
+import questionary
 import tyro
 from botocore.exceptions import ClientError
 from natsort import natsorted
-from nutree import Tree
+from nutree import SkipBranch, StopTraversal, Tree, UniqueConstraintError
 from nutree.node import Node
 from rich.logging import RichHandler
+from rich.progress import (
+    BarColumn,
+    Progress,
+    TaskProgressColumn,
+    TextColumn,
+    TimeRemainingColumn,
+)
 from rich.status import Status
 from rich.traceback import install
-from typing_extensions import TYPE_CHECKING, Annotated, Callable, TypeAlias, cast
+from typing_extensions import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Callable,
+    Protocol,
+    TypeAlias,
+    cast,
+)
 
 if TYPE_CHECKING:
     from types_boto3_s3 import Client as S3Client
 
+app = tyro.extras.SubcommandApp()
 logging.basicConfig(
     level=os.environ.get("LOGLEVEL", "INFO").upper(),
     format="%(message)s",
@@ -48,6 +68,20 @@ _SIZE_SYMBOLS = ("B", "K", "M", "G", "T", "P", "E", "Z", "Y")
 _SIZE_BOUNDS = [(1024**i, sym) for i, sym in enumerate(_SIZE_SYMBOLS)]
 _SIZE_DICT = {sym: val for val, sym in _SIZE_BOUNDS}
 _SIZE_RANGES = list(zip(_SIZE_BOUNDS, _SIZE_BOUNDS[1:]))
+
+
+class UpdateFn(Protocol):
+    """Mirrors `rich.progress.Progress.update` with curried task-id argument"""
+
+    def __call__(
+        self,
+        total: float | None = None,
+        completed: float | None = None,
+        advance: float | None = None,
+        description: str | None = None,
+        visible: bool | None = None,
+        refresh: bool = False,
+    ) -> None: ...
 
 
 def _bytes_from_str(size: str | list[str]) -> int:
@@ -103,15 +137,11 @@ def upload_file(
     s3_client: S3Client,
     bucket: str,
     public: bool = True,
-    dry: bool = False,
 ) -> None:
     try:
-        if dry:
-            log.info(f"Would have uploaded {src} to {dst}.")
-        else:
-            log.info(f"Uploading {src} as {dst}...")
-            extra_args = {"ACL": "public-read"} if public else {}
-            s3_client.upload_file(str(src), str(bucket), str(dst), ExtraArgs=extra_args)
+        log.info(f"Uploading {src} as {dst}...")
+        extra_args = {"ACL": "public-read"} if public else {}
+        s3_client.upload_file(str(src), str(bucket), str(dst), ExtraArgs=extra_args)
     except ClientError as e:
         log.error(f"Failed to upload {src} to {dst}.")
         log.error(e)
@@ -120,51 +150,35 @@ def upload_file(
 @dataclass
 class PathData:
     path: Path
-    depth: int
+    is_zip: bool = False
+    has_zip_descendants: bool = False
     size: int | None = None
-    grouped_children: list[Tree] = field(default_factory=list)
 
     def __str__(self):
-        # subtree = "\n".join(', '.join(str(n.data) for n in t.children) for t in self.grouped_children)
-        subtree = "\n".join(t.format(repr='{node.data}') for t in self.grouped_children)
-        subtree = textwrap.indent(subtree, self.depth * "    ")
-
-        return (
-            f"{'📁' if self.path.is_dir() else '📄'} "
-            f"{self.path.name} ({_bytes_to_str(self.size or 0)}) "
-            f"{"\n" + subtree if self.grouped_children else ''}"
-            # f"{len(self.grouped_children)}"
-        ).strip()
+        icon = "💾" if self.is_zip else "📁" if self.path.is_dir() else "📄"
+        return f"{icon} {self.path.name} ({_bytes_to_str(self.size or 0)})"
 
     def __hash__(self):
-        return hash((self.path, *self.grouped_children))
+        return hash((self.path, self.is_zip))
 
     @staticmethod
     def serialize_mapper(node, data):
-        def serialize_tree(tree):
-            with io.StringIO() as f:
-                tree.save(f, mapper=PathData.serialize_mapper)
-                f.seek(0)
-                return f.read()
-            
         data["data"] = (
             str(node.data.path),
-            node.data.depth,
+            node.data.is_zip,
+            node.data.has_zip_descendants,
             node.data.size,
-            [serialize_tree(t) for t in node.data.grouped_children],
         )
         return data
 
     @staticmethod
     def deserialize_mapper(parent, data):
-        def deserialize_tree(data):
-            with io.StringIO(data) as f:
-                f.seek(0)
-                return Tree.load(f, mapper=PathData.deserialize_mapper)
-    
-        path, depth, size, children = data["data"]
+        path, is_zip, has_zip_descendants, size = data["data"]
         return PathData(
-            path=Path(path), depth=depth, size=size, grouped_children=[deserialize_tree(d) for d in children]
+            path=Path(path),
+            is_zip=is_zip,
+            has_zip_descendants=has_zip_descendants,
+            size=size,
         )
 
 
@@ -213,7 +227,7 @@ def directory_tree(
 ) -> Tree:
     tree: Tree = Tree("Directory Listing")
     path = Path(path).resolve()
-    root = tree.add(PathData(path=path, depth=1))
+    root = tree.add(PathData(path=path))
     path2node = {str(root.data.path.resolve()): root}
     skipped_dirs = set()
 
@@ -230,14 +244,13 @@ def directory_tree(
 
         for dirname in dirnames:
             if filter_fn is None or filter_fn(dirpath / dirname):
-                child_data = PathData(path=dirpath / dirname, depth=parent.data.depth+1)
+                child_data = PathData(path=dirpath / dirname)
                 child = parent.add(child_data)
                 path2node[str(child.data.path.resolve())] = child
         for filename in filenames:
             if filter_fn is None or filter_fn(dirpath / filename):
                 child_data = PathData(
                     path=dirpath / filename,
-                    depth=parent.data.depth+1,
                     size=(dirpath / filename).stat().st_size,
                 )
                 child = parent.add(child_data)
@@ -272,7 +285,7 @@ def partition_tree_by_fnmatches(
     )
 
     all_leafs = set(n.data.path for n in tree.find_all(match=lambda n: n.is_leaf()))
-    all_matched_leafs = functools.reduce(set.union, (set(l) for l in matched_leafs))
+    all_matched_leafs = reduce(set.union, (set(l) for l in matched_leafs))
     assert all_matched_leafs == all_leafs
 
     subtrees = [
@@ -294,69 +307,147 @@ def partition_tree_by_fnmatches(
 
 def split_into_chunks(
     *,
-    node: Node | Tree,
+    tree: Tree,
     chunk_size=_bytes_from_str("200MB"),
-) -> Tree | None:
-    if isinstance(node, Tree):
-        root = node.first_child()
-
-        if root is not None:
-            split_into_chunks(node=root, chunk_size=chunk_size)
-            return node
-        return
-
-    for child in node.children:
-        split_into_chunks(node=child, chunk_size=chunk_size)
-
-    has_grouped_children= any(
-        c.data.grouped_children for c in node.children
-    )
-    
-    if node.data.path.is_dir() and (node.data.size > chunk_size or node.is_top()):
-        # Sort children with files first
-        children = natsorted(
-            filter(lambda n: not any(c.data.grouped_children for c in n.iterator(add_self=True)), node.children),
-            # node.children,
-            key=lambda n: (n.data.path.is_file(), str(n.data.path)),
-        )
-
-        cumulative_sizes = list(itertools.accumulate(c.data.size for c in children))
-        groups_lengths = [
-            len(g)
-            for g in mitertools.split_when(
-                cumulative_sizes,
-                lambda x, y: x // chunk_size != y // chunk_size,
+) -> Tree:
+    def find_splits(*, node: Node, splits: dict[tuple[int, int], list[Node]]) -> None:
+        # First recurse and propagate the has_zip_descendants label up
+        for child in node.children:
+            find_splits(node=child, splits=splits)
+            node.data.has_zip_descendants = (
+                node.data.has_zip_descendants or child.data.has_zip_descendants
             )
-        ]
-        children_iter = iter(children)
 
-        for i, group_size in enumerate(groups_lengths):        
-            tree = Tree("Zip Folder")
-            group_children = mitertools.take(group_size, children_iter)
+        # Split node if too big, making sure to exclude children with zip descendants
+        if node.data.size > chunk_size or node.is_top():
+            children = natsorted(
+                filter(lambda n: not n.data.has_zip_descendants, node.children),
+                key=lambda n: (n.data.path.is_file(), str(n.data.path)),
+            )
+            cumulative_sizes = list(itertools.accumulate(c.data.size for c in children))
+            groups_lengths = [
+                len(g)
+                for g in mitertools.split_when(
+                    cumulative_sizes,
+                    lambda x, y: x // chunk_size != y // chunk_size,
+                )
+            ]
+            children_iter = iter(children)
 
-            for child in group_children:
-                child.copy_to(tree)
-                child.remove()
-            node.data.grouped_children.append(tree)
+            for i, group_size in enumerate(groups_lengths):
+                group_children = mitertools.take(group_size, children_iter)
+                splits[(node.data_id, i)] = group_children
+                node.data.has_zip_descendants = True
+
+    def validate_ziptree(node: Node, _memo: Any) -> SkipBranch | StopTraversal | None:
+        if node.data.is_zip:
+            if node.is_leaf():
+                raise StopTraversal(RuntimeError(f"Found empty zipped node: {node}."))
+            raise SkipBranch
+        elif node.is_leaf():
+            raise StopTraversal(RuntimeError(f"Found non-zipped leaf node: {node}."))
+        return None
+
+    splits = {}
+    root = tree.first_child()
+    raw_files = set(
+        str(n.data.path) for n in tree.find_all(match=lambda n: n.is_leaf())
+    )
+
+    # Find places for zips without modifying tree topology!
+    find_splits(node=root, splits=splits)
+
+    # Create new zipnodes for every zip
+    for (data_id, i), group_children in splits.items():
+        node = tree.find(data_id=data_id)
+        zipnode_data = PathData(
+            path=node.data.path.with_name(f"{node.data.path.stem}_{i}.zip"),
+            size=sum(c.data.size for c in group_children),
+            is_zip=True,
+        )
+        zipnode = node.up().add(zipnode_data)
+
+        # Move over contents of zip file
+        for c in group_children:
+            c.move_to(zipnode)
+
+        # Remove node once we've removed all children
+        if not node.children:
+            node.remove()
+
+    # Ensure no files are missed
+    zip_files = set(
+        str(n.data.path) for n in tree.find_all(match=lambda n: n.is_leaf())
+    )
+
+    if diff := raw_files - zip_files:
+        raise RuntimeError(f"Detected missing files in ziptree: {diff}")
+
+    # Validate that there are no non zipped leaves
+    if error := tree.visit(validate_ziptree):
+        raise error
+    return tree
 
 
-if __name__ == "__main__":
-    if boto3.__version__ != "1.35.31":
-        log.warning(
-            "Please use boto3==1.35.31 as other versions might fail to upload files!!"
+@dataclass
+class S3Connection:
+    bucket: str
+    """Name of S3 bucket."""
+    prefix: str
+    """Prefix path of s3 objects."""
+
+
+@app.command
+def partition_and_upload(
+    path: Path,
+    /,
+    s3: S3Connection | None,
+    chunk_size: MemSize = _bytes_from_str("10GB"),
+    exclude: list[str] = [],
+    tmp_dir: Path | None = None,
+    keep: bool = False,
+    follow_symlinks: bool = False,
+    overwrite: bool = False,
+    dry: bool = True,
+) -> None:
+    """Auto-partition dataset into archives and upload them to an S3 bucket.
+
+    Args:
+        path (Path): Directory to upload.
+        chunk_size (MemSize, optional): Target size of archives (pre-compression).
+            At most each (deflated) zip will be one and a half time this size.
+        exclude (list[str], optional): Space separated list of path exclusion
+            patterns. Warning something like "logs/" will match any path that
+            contains logs. Internally uses `Path.match`.
+        tmp_dir (Path, optional): Location of scratch dir
+            used to build archives. Useful if the `chunk_size` is more than a
+            few GBs. Defaults to OS default tmp directory.
+        keep (bool, optional): If true, the temporary directory is kept. Useful for
+            debugging or for making a local archive instead of using S3 if `--dry` is set.
+        follow_symlinks (bool, optional): If true, symlinks will be followed.
+            Careful, this can lead to infinite recursions!
+        overwrite (bool, optional): If true, objects in the S3 bucket will be
+            overwritten by new ones that share the same key, otherwise the
+            conflicting uploads are skipped.
+        dry (bool, optional): If true, do not actually upload anything.
+    """
+    if not dry and s3 is None:
+        raise ValueError(
+            "S3 connection settings must be set if not running in dry mode!"
         )
 
+    # Create filesystem tree and split it into zip-sized chunks
     def path_filter(p):
-        keep = is_not_hidden(p) and is_not_dunder(p) and not is_match(p, patterns=[])
+        keep = (
+            is_not_hidden(p) and is_not_dunder(p) and not is_match(p, patterns=exclude)
+        )
         if not keep:
             log.debug(f"Excluding {p} ({_bytes_to_str(p.stat().st_size)})")
         return keep
 
     with Status("Building Tree...", spinner="bouncingBall") as status:
         file_tree = directory_tree(
-            Path("/home/sjung/Downloads/010-00/"),
-            filter_fn=path_filter,
-            follow_symlinks=False,
+            path, filter_fn=path_filter, follow_symlinks=follow_symlinks
         )
 
     with Status("Partitioning Tree...", spinner="bouncingBall") as status:
@@ -371,11 +462,137 @@ if __name__ == "__main__":
                 "**/previews/**",
             ],
         )
+        subtrees = {k.strip("*/") if k else "metadata": v for k, v in subtrees.items()}
 
-    # for st in subtrees.values():
-    #     st.print(repr="{node.data}")
+    with Status(
+        f"Splitting into ~{_bytes_to_str(chunk_size)} chunks...", spinner="bouncingBall"
+    ) as status:
+        subtrees = {
+            k: split_into_chunks(tree=st, chunk_size=chunk_size)
+            for k, st in subtrees.items()
+        }
 
-    tree = subtrees[None]
-    # tree = subtrees["**/frames/**"]
-    tree = split_into_chunks(node=tree, chunk_size=_bytes_from_str("10MB"))
-    tree.print(repr="{node.data}")
+    for prefix, tree in subtrees.items():
+        slim_tree = tree.filtered(
+            lambda n: SkipBranch(and_self=False) if n.data.is_zip else True
+        )
+        slim_tree.name = prefix.title()
+        slim_tree.print(repr="{node.data}")
+        print()
+
+    if not questionary.confirm("Confirm zip partition?", default=False).ask():
+        sys.exit(1)
+
+    # Confirm all s3 settings, ensure we don't accidentally upload anything
+    if not dry:
+        if not questionary.confirm(
+            "Not running in dry mode, this will upload artifacts to S3. Confirm?",
+            default=False,
+        ).ask():
+            sys.exit(1)
+
+        public = questionary.confirm(
+            "Make uploaded artifacts public?", default=False
+        ).ask()
+        s3_client = boto3.client("s3")
+        exists = partial(check_exists, s3_client=s3_client, bucket=s3.bucket)
+        upload = partial(
+            upload_file, bucket=s3.bucket, s3_client=s3_client, public=public
+        )
+    else:
+        # Do not check existence if not uploading
+        upload = lambda src, dst: log.info(f"Would have uploaded {src} to {dst}.")
+        exists = lambda *args, **kwargs: False
+
+    if keep and tmp_dir:
+        # Use user-supplied tmp_dir directly, do not delete anything from it
+        context = partial(contextlib.nullcontext, enter_result=tmp_dir.resolve())
+    elif keep and tmp_dir is None:
+        # Use a single tmpdir, open context manager here and keep contents
+        with tempfile.TemporaryDirectory(delete=False) as tmpdir:
+            context = partial(contextlib.nullcontext, enter_result=tmpdir)
+            log.info(f"Using tempdir {tmpdir}")
+    elif not keep:
+        # We're not keeping the tempdir, so we can safely re-enter into a new
+        # temporary directory every time which helps keep it a manageable size
+        context = partial(
+            tempfile.TemporaryDirectory, dir=tmp_dir.resolve(), delete=True
+        )
+
+    # Callable used to visit tree, will zip up all descendant of a zip node and upload it
+    def upload_ziptree(
+        node: Node,
+        memo: Any,
+        *,
+        prefix: str,
+        context: Callable,
+        update_fn: UpdateFn,
+    ) -> SkipBranch | None:
+        if not node.data.is_zip:
+            return None
+
+        relative_root = node.data.path.relative_to(path.parent)
+        object_key = Path(s3.prefix) / prefix / relative_root
+        update_fn(description=f"Compressing {node.data.path.name}")
+
+        if not overwrite and exists(key=object_key):
+            log.info(
+                f"Skipping {object_key} as objects with the same key exists in bucket."
+            )
+            update_fn(advance=1)
+            raise SkipBranch
+
+        with context() as tmpdir:
+            zip_path = Path(tmpdir) / prefix / relative_root
+            zip_path.parent.mkdir(exist_ok=True, parents=True)
+
+            with zipfile.ZipFile(zip_path, mode="w") as archive:
+                if not dry or keep:
+                    for n in node.find_all(match=lambda n: n.is_leaf(), add_self=True):
+                        archive.write(
+                            n.data.path,
+                            arcname=n.data.path.relative_to(node.data.path.parent),
+                        )
+            update_fn(description=f"Uploading {node.data.path.name}")
+            upload(zip_path, object_key)
+        update_fn(advance=1)
+        raise SkipBranch
+
+    for i, (prefix, tree) in enumerate(subtrees.items()):
+        with Progress(
+            TextColumn(
+                f"({i+1}/{len(subtrees)}) " + "[progress.description]{task.description}"
+            ),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeRemainingColumn(elapsed_when_finished=True),
+        ) as progress:
+            task = progress.add_task(
+                "", total=len(tree.find_all(match=lambda n: n.data.is_zip))
+            )
+            update_fn = partial(progress.update, task)
+            tree.visit(
+                partial(
+                    upload_ziptree, prefix=prefix, context=context, update_fn=update_fn
+                )
+            )
+
+
+if __name__ == "__main__":
+    if boto3.__version__ != "1.35.31":
+        log.warning(
+            "Please use boto3==1.35.31 as other versions might fail to upload files!!"
+        )
+
+    # app.cli(config=(tyro.conf.DisallowNone, ))
+
+    partition_and_upload(
+        Path("/home/sjung/Downloads/010-00/"),
+        chunk_size=_bytes_from_str("25MB"),
+        s3=S3Connection(bucket="bucket", prefix="dataset"),
+        keep=True,
+        tmp_dir=Path("/home/sjung/Downloads/tmp/"),
+    )
+
+    # tree.print(repr="{node.data}")
+    # tree.save("dump.json", mapper=PathData.serialize_mapper)
