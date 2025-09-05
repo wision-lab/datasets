@@ -1,0 +1,28 @@
+{
+  "frames": {
+    "pattern": "**/frames/**",
+    "min_zip_depth": 3
+  },
+  "depths": {
+    "pattern": "**/depths/**",
+    "min_zip_depth": 3
+  },
+  "normals": {
+    "pattern": "**/normals/**",
+    "min_zip_depth": 3
+  },
+  "flows": {
+    "pattern": "**/flows/**",
+    "min_zip_depth": 3
+  },
+  "segmentations": {
+    "pattern": "**/segmentations/**",
+    "min_zip_depth": 3
+  },
+  "previews": {
+    "pattern": "**/previews/**"
+  },
+  "metadata": {
+    "pattern": null
+  }
+}
