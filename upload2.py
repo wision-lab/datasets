@@ -122,9 +122,17 @@ MemSize: TypeAlias = Annotated[
 ]
 
 
-def check_exists(*, s3_client: S3Client, bucket: str, key: str | os.PathLike) -> bool:
+@dataclass
+class S3Connection:
+    bucket: str
+    """Name of S3 bucket."""
+    prefix: str
+    """Prefix path of s3 objects."""
+
+
+def check_exists(*, s3_client: S3Client, conn: S3Connection, key: str | os.PathLike) -> bool:
     try:
-        s3_client.head_object(Bucket=str(bucket), Key=str(key))
+        s3_client.head_object(Bucket=conn.bucket, Key=str(Path(conn.prefix) / key))
     except ClientError as e:
         return int(e.response["Error"]["Code"]) != 404
     return True
@@ -135,13 +143,13 @@ def upload_file(
     dst: str | os.PathLike,
     *,
     s3_client: S3Client,
-    bucket: str,
+    conn: S3Connection,
     public: bool = True,
 ) -> None:
     try:
         log.info(f"Uploading {src} as {dst}...")
         extra_args = {"ACL": "public-read"} if public else {}
-        s3_client.upload_file(str(src), str(bucket), str(dst), ExtraArgs=extra_args)
+        s3_client.upload_file(str(src), conn.bucket, str(Path(conn.prefix) / dst), ExtraArgs=extra_args)
     except ClientError as e:
         log.error(f"Failed to upload {src} to {dst}.")
         log.error(e)
@@ -262,6 +270,20 @@ def directory_tree(
 def partition_tree_by_fnmatches(
     *, tree: Tree, patterns: list[str]
 ) -> dict[str | None, Tree]:
+    """Split tree into disjoint partitions based on pattern matches.
+
+    Warning:
+        Expects partitions to have disjoint set of leaf nodes (intermediate nodes
+        can be shared), all nodes that do not match any pattern will be mapped to
+        a separate subtree.
+
+    Args:
+        tree (Tree): The tree to partition.
+        patterns (list[str]): _description_
+
+    Returns:
+        dict[str | None, Tree]: _description_
+    """
     matched_leafs = [
         {
             n.data.path: n
@@ -310,7 +332,9 @@ def split_into_chunks(
     tree: Tree,
     chunk_size=_bytes_from_str("200MB"),
 ) -> Tree:
-    def find_splits(*, node: Node, splits: dict[tuple[int, int], list[Node]]) -> None:
+    def find_splits(
+        *, node: Node, splits: dict[tuple[str | int, int], list[Node]]
+    ) -> None:
         # First recurse and propagate the has_zip_descendants label up
         for child in node.children:
             find_splits(node=child, splits=splits)
@@ -348,8 +372,11 @@ def split_into_chunks(
             raise StopTraversal(RuntimeError(f"Found non-zipped leaf node: {node}."))
         return None
 
-    splits = {}
-    root = tree.first_child()
+    if (root := tree.first_child()) is None:
+        # Empty tree
+        return tree
+
+    splits: dict[tuple[str | int, int], list[Node]] = {}
     raw_files = set(
         str(n.data.path) for n in tree.find_all(match=lambda n: n.is_leaf())
     )
@@ -360,6 +387,8 @@ def split_into_chunks(
     # Create new zipnodes for every zip
     for (data_id, i), group_children in splits.items():
         node = tree.find(data_id=data_id)
+        assert isinstance(node, Node)
+
         zipnode_data = PathData(
             path=node.data.path.with_name(f"{node.data.path.stem}_{i}.zip"),
             size=sum(c.data.size for c in group_children),
@@ -389,26 +418,17 @@ def split_into_chunks(
     return tree
 
 
-@dataclass
-class S3Connection:
-    bucket: str
-    """Name of S3 bucket."""
-    prefix: str
-    """Prefix path of s3 objects."""
-
-
 @app.command
 def partition_and_upload(
     path: Path,
     /,
-    s3: S3Connection | None,
+    s3: S3Connection | None = None,
     chunk_size: MemSize = _bytes_from_str("10GB"),
     exclude: list[str] = [],
     tmp_dir: Path | None = None,
     keep: bool = False,
     follow_symlinks: bool = False,
     overwrite: bool = False,
-    dry: bool = True,
 ) -> None:
     """Auto-partition dataset into archives and upload them to an S3 bucket.
 
@@ -423,18 +443,14 @@ def partition_and_upload(
             used to build archives. Useful if the `chunk_size` is more than a
             few GBs. Defaults to OS default tmp directory.
         keep (bool, optional): If true, the temporary directory is kept. Useful for
-            debugging or for making a local archive instead of using S3 if `--dry` is set.
+            debugging or for making a local archive instead of using S3 if
+            S3 connection parameters are not set.
         follow_symlinks (bool, optional): If true, symlinks will be followed.
             Careful, this can lead to infinite recursions!
         overwrite (bool, optional): If true, objects in the S3 bucket will be
             overwritten by new ones that share the same key, otherwise the
             conflicting uploads are skipped.
-        dry (bool, optional): If true, do not actually upload anything.
     """
-    if not dry and s3 is None:
-        raise ValueError(
-            "S3 connection settings must be set if not running in dry mode!"
-        )
 
     # Create filesystem tree and split it into zip-sized chunks
     def path_filter(p):
@@ -476,7 +492,7 @@ def partition_and_upload(
         slim_tree = tree.filtered(
             lambda n: SkipBranch(and_self=False) if n.data.is_zip else True
         )
-        slim_tree.name = prefix.title()
+        slim_tree.name = (prefix or "metadata").title()
         slim_tree.print(repr="{node.data}")
         print()
 
@@ -484,9 +500,9 @@ def partition_and_upload(
         sys.exit(1)
 
     # Confirm all s3 settings, ensure we don't accidentally upload anything
-    if not dry:
+    if s3 is not None:
         if not questionary.confirm(
-            "Not running in dry mode, this will upload artifacts to S3. Confirm?",
+            "Not running in local mode, this will upload artifacts to S3. Confirm?",
             default=False,
         ).ask():
             sys.exit(1)
@@ -495,10 +511,8 @@ def partition_and_upload(
             "Make uploaded artifacts public?", default=False
         ).ask()
         s3_client = boto3.client("s3")
-        exists = partial(check_exists, s3_client=s3_client, bucket=s3.bucket)
-        upload = partial(
-            upload_file, bucket=s3.bucket, s3_client=s3_client, public=public
-        )
+        exists: Callable = partial(check_exists, s3_client=s3_client, conn=s3)
+        upload: Callable = partial(upload_file, s3_client=s3_client, conn=s3, public=public)
     else:
         # Do not check existence if not uploading
         upload = lambda src, dst: log.info(f"Would have uploaded {src} to {dst}.")
@@ -516,7 +530,9 @@ def partition_and_upload(
         # We're not keeping the tempdir, so we can safely re-enter into a new
         # temporary directory every time which helps keep it a manageable size
         context = partial(
-            tempfile.TemporaryDirectory, dir=tmp_dir.resolve(), delete=True
+            cast(Callable, tempfile.TemporaryDirectory),
+            dir=tmp_dir.resolve() if tmp_dir is not None else None,
+            delete=True,
         )
 
     # Callable used to visit tree, will zip up all descendant of a zip node and upload it
@@ -524,15 +540,14 @@ def partition_and_upload(
         node: Node,
         memo: Any,
         *,
-        prefix: str,
+        prefix: str | None,
         context: Callable,
         update_fn: UpdateFn,
     ) -> SkipBranch | None:
         if not node.data.is_zip:
             return None
 
-        relative_root = node.data.path.relative_to(path.parent)
-        object_key = Path(s3.prefix) / prefix / relative_root
+        object_key = Path(prefix or "") / node.data.path.relative_to(path.parent)
         update_fn(description=f"Compressing {node.data.path.name}")
 
         if not overwrite and exists(key=object_key):
@@ -543,11 +558,11 @@ def partition_and_upload(
             raise SkipBranch
 
         with context() as tmpdir:
-            zip_path = Path(tmpdir) / prefix / relative_root
+            zip_path = Path(tmpdir) / object_key
             zip_path.parent.mkdir(exist_ok=True, parents=True)
 
             with zipfile.ZipFile(zip_path, mode="w") as archive:
-                if not dry or keep:
+                if s3 is not None or keep:
                     for n in node.find_all(match=lambda n: n.is_leaf(), add_self=True):
                         archive.write(
                             n.data.path,
@@ -589,7 +604,7 @@ if __name__ == "__main__":
     partition_and_upload(
         Path("/home/sjung/Downloads/010-00/"),
         chunk_size=_bytes_from_str("25MB"),
-        s3=S3Connection(bucket="bucket", prefix="dataset"),
+        # s3=S3Connection(bucket="bucket", prefix="dataset"),
         keep=True,
         tmp_dir=Path("/home/sjung/Downloads/tmp/"),
     )
