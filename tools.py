@@ -49,6 +49,7 @@ from typing_extensions import (
     TypeAlias,
     cast,
 )
+from tyro.extras import SubcommandApp
 
 if TYPE_CHECKING:
     from types_boto3_s3 import Client as S3Client
@@ -62,6 +63,7 @@ logging.basicConfig(
 logging.getLogger("PIL").setLevel(logging.WARNING)
 log = logging.getLogger("rich")
 install(suppress=[tyro])
+app = SubcommandApp()
 
 _SIZE_SYMBOLS = ("B", "K", "M", "G", "T", "P", "E", "Z", "Y")
 _SIZE_BOUNDS = [(1024**i, sym) for i, sym in enumerate(_SIZE_SYMBOLS)]
@@ -170,12 +172,17 @@ def upload_file(
 @dataclass
 class PathData:
     path: Path
+    is_dir: bool | None = None
     is_zip: bool = False
     has_zip_descendants: bool = False
     size: int | None = None
 
+    def __post_init__(self):
+        if self.is_dir is None:
+            self.is_dir = self.path.is_dir()
+
     def __str__(self):
-        icon = "💾" if self.is_zip else "📁" if self.path.is_dir() else "📄"
+        icon = "💾" if self.is_zip else "📁" if self.is_dir else "📄"
         return f"{icon} {self.path.name} ({_bytes_to_str(self.size or 0)})"
 
     def __hash__(self):
@@ -185,6 +192,7 @@ class PathData:
     def serialize_mapper(node, data):
         data["data"] = (
             str(node.data.path),
+            node.data.is_dir,
             node.data.is_zip,
             node.data.has_zip_descendants,
             node.data.size,
@@ -193,9 +201,10 @@ class PathData:
 
     @staticmethod
     def deserialize_mapper(parent, data):
-        path, is_zip, has_zip_descendants, size = data["data"]
+        path, is_dir, is_zip, has_zip_descendants, size = data["data"]
         return PathData(
             path=Path(path),
+            is_dir=is_dir,
             is_zip=is_zip,
             has_zip_descendants=has_zip_descendants,
             size=size,
@@ -234,7 +243,7 @@ def populate_filesize(*, node: Node | Tree, refresh: bool = False) -> Node | Tre
     for child in node.children:
         populate_filesize(node=child, refresh=refresh)
 
-    if (node.data.path.is_dir() and refresh) or node.data.size is None:
+    if (node.data.is_dir and refresh) or node.data.size is None:
         node.data.size = sum(c.data.size for c in node.children)
     return node
 
@@ -451,7 +460,29 @@ def split_into_chunks(
     return tree
 
 
-def main(
+@app.command
+def show_tree(path: Path, /, full: bool = False) -> None:
+    """Print out (zip) tree given it's path
+
+    Args:
+        path (Path): Path to saved tree (expects a json file).
+        full (bool, optional): If true, also print contents of zip files.
+    """
+    tree: Tree = Tree.load(path, mapper=PathData.deserialize_mapper)
+    tree.name = path.name 
+    
+    if not full:
+        slim_tree = tree.filtered(
+            lambda n: SkipBranch(and_self=False) if n.data.is_zip else True
+        )
+        slim_tree.name = tree.name
+        slim_tree.print(repr="{node.data}")
+    else:
+        tree.print(repr="{node.data}")
+
+
+@app.command
+def upload(
     path: Path,
     /,
     s3: S3Connection = S3Connection(),
@@ -636,9 +667,12 @@ def main(
             )
 
     # Save all subtrees for future inspection
+    (path / "trees").mkdir(exist_ok=True, parents=True)
     for k, st in subtrees.items():
         st.save(
-            path / "trees" / f"{k or 'tree'}.json", mapper=PathData.serialize_mapper
+            path / "trees" / f"{k or 'tree'}.json",
+            mapper=PathData.serialize_mapper,
+            compression=True,
         )
 
 
@@ -647,4 +681,4 @@ if __name__ == "__main__":
         log.warning(
             "Please use boto3==1.35.31 as other versions might fail to upload files!!"
         )
-    tyro.cli(main)
+    app.cli()
