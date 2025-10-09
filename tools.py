@@ -27,7 +27,7 @@ import more_itertools as mitertools
 import questionary
 import tyro
 from botocore.exceptions import ClientError
-from natsort import natsorted
+from natsort import natsorted, natsort_key
 from nutree import SkipBranch, StopTraversal, Tree
 from nutree.node import Node
 from rich.logging import RichHandler
@@ -476,8 +476,10 @@ def show_tree(path: Path, /, full: bool = False) -> None:
             lambda n: SkipBranch(and_self=False) if n.data.is_zip else True
         )
         slim_tree.name = tree.name
+        slim_tree.sort(key=lambda n: natsort_key(n.name), deep=True)
         slim_tree.print(repr="{node.data}")
     else:
+        tree.sort(key=lambda n: natsort_key(n.name), deep=True)
         tree.print(repr="{node.data}")
 
 
