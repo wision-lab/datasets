@@ -266,13 +266,13 @@ def directory_tree(
     for dirpath, dirnames, filenames in Path(path).walk(
         on_error=on_error, follow_symlinks=follow_symlinks
     ):
-        parent = path2node[str(dirpath.resolve())]
-
         if filter_fn is not None and (
             not filter_fn(dirpath) or dirpath.parent in skipped_dirs
         ):
             skipped_dirs.add(dirpath)
             continue
+        
+        parent = path2node[str(dirpath.resolve())]
 
         for dirname in dirnames:
             if filter_fn is None or filter_fn(dirpath / dirname):
@@ -592,6 +592,8 @@ def upload(
         upload = lambda src, dst: log.info(f"Would have uploaded {src} to {dst}.")
         exists = lambda *args, **kwargs: False
 
+    if tmp_dir:
+        tmp_dir.mkdir(exist_ok=True, parents=True)
     if keep and tmp_dir:
         # Use user-supplied tmp_dir directly, do not delete anything from it
         context = partial(contextlib.nullcontext, enter_result=tmp_dir.resolve())
