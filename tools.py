@@ -133,16 +133,15 @@ class S3Connection:
 
 def check_exists(
     *, s3_client: S3Client, conn: S3Connection, key: str | os.PathLike
-) -> bool:
+) -> int:
     if conn.bucket is None:
         raise ValueError("Bucket name not specified!")
     try:
-        s3_client.head_object(
+        return s3_client.head_object(
             Bucket=conn.bucket, Key=str(Path(conn.prefix or "") / key)
-        )
-    except ClientError as e:
-        return int(e.response["Error"]["Code"]) != 404
-    return True
+        )["ContentLength"]
+    except ClientError:
+        return 0
 
 
 def upload_file(
@@ -323,7 +322,7 @@ def partition_tree_by_fnmatches(
     reverse_patterns = {v: k for k, v in patterns.items()}
 
     if len(patterns) != len(reverse_patterns):
-        raise RuntimeError(f"Multiple partitions have the same pattern!")
+        raise RuntimeError("Multiple partitions have the same pattern!")
 
     if None not in reverse_patterns:
         patterns[default_groupname] = None
@@ -531,7 +530,7 @@ def upload(
             conflicting uploads are skipped.
     """
     if min_zip_depth <= 0:
-        raise ValueError(f"Argument `min_zip_depth` must be at least 1.")
+        raise ValueError("Argument `min_zip_depth` must be at least 1.")
 
     # Create filesystem tree and split it into zip-sized chunks
     def path_filter(p):
@@ -559,7 +558,7 @@ def upload(
 
     with Status(
         f"Splitting into {_bytes_to_str(chunk_size)} chunks...", spinner="bouncingBall"
-    ) as status:
+    ):
         subtrees = {
             k: split_into_chunks(
                 tree=st,
@@ -599,7 +598,7 @@ def upload(
     else:
         # Do not check existence if not uploading
         upload = lambda src, dst: log.info(f"Would have uploaded {src} to {dst}.")
-        exists = lambda *args, **kwargs: False
+        exists = lambda *args, **kwargs: 0
 
     if tmp_dir:
         tmp_dir.mkdir(exist_ok=True, parents=True)
@@ -635,10 +634,11 @@ def upload(
         object_key = Path(prefix or "") / node.data.path.relative_to(path.parent)
         update_fn(description=f"Compressing {node.data.path.name}")
 
-        if not overwrite and exists(key=object_key):
+        if not overwrite and (zip_size := exists(key=object_key)):
             log.info(
                 f"Skipping {object_key} as objects with the same key exists in bucket."
             )
+            node.data.zip_size = zip_size
             update_fn(advance=1)
             raise SkipBranch
 
@@ -664,7 +664,8 @@ def upload(
     for i, (prefix, tree) in enumerate(subtrees.items()):
         with Progress(
             TextColumn(
-                f"(Partition {i+1}/{len(subtrees)}) " + "[progress.description]{task.description}"
+                f"(Partition {i+1}/{len(subtrees)}) "
+                + "[progress.description]{task.description}"
             ),
             BarColumn(),
             TaskProgressColumn(),
@@ -688,14 +689,12 @@ def upload(
             mapper=PathData.serialize_mapper,
             compression=True,
         )
-        root = st.first_child()
-        compressed_size = sum(
-            root.find_all(match=lambda n: n.data.zip_size(), add_self=True)
-        )
+        size = sum(n.data.size for n in st.children) 
+        compressed_size = sum(n.data.zip_size or 0 for n in st)
         log.info(
-            f"Total file: {_bytes_to_str(root.data.size)}, "
+            f"Total file: {_bytes_to_str(size)}, "
             f"Compressed size: {_bytes_to_str(compressed_size)}, "
-            f"Compression ratio: ({root.data.size/compressed_size:.1f}x)"
+            f"Compression ratio: ({size/compressed_size:.1f}x)"
         )
 
 
