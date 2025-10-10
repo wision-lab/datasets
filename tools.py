@@ -27,7 +27,7 @@ import more_itertools as mitertools
 import questionary
 import tyro
 from botocore.exceptions import ClientError
-from natsort import natsorted, natsort_key
+from natsort import natsort_key, natsorted
 from nutree import SkipBranch, StopTraversal, Tree
 from nutree.node import Node
 from rich.logging import RichHandler
@@ -176,6 +176,7 @@ class PathData:
     is_zip: bool = False
     has_zip_descendants: bool = False
     size: int | None = None
+    zip_size: int | None = None
 
     def __post_init__(self):
         if self.is_dir is None:
@@ -183,7 +184,11 @@ class PathData:
 
     def __str__(self):
         icon = "💾" if self.is_zip else "📁" if self.is_dir else "📄"
-        return f"{icon} {self.path.name} ({_bytes_to_str(self.size or 0)})"
+        size = _bytes_to_str(self.size or 0)
+        size += (
+            f" {self.size/self.zip_size:.1f}x" if self.is_zip and self.zip_size else ""
+        )
+        return f"{icon} {self.path.name} ({size})"
 
     def __hash__(self):
         return hash((self.path, self.is_zip))
@@ -196,18 +201,20 @@ class PathData:
             node.data.is_zip,
             node.data.has_zip_descendants,
             node.data.size,
+            node.data.zip_size,
         )
         return data
 
     @staticmethod
     def deserialize_mapper(parent, data):
-        path, is_dir, is_zip, has_zip_descendants, size = data["data"]
+        path, is_dir, is_zip, has_zip_descendants, size, zip_size = data["data"]
         return PathData(
             path=Path(path),
             is_dir=is_dir,
             is_zip=is_zip,
             has_zip_descendants=has_zip_descendants,
             size=size,
+            zip_size=zip_size,
         )
 
 
@@ -271,7 +278,7 @@ def directory_tree(
         ):
             skipped_dirs.add(dirpath)
             continue
-        
+
         parent = path2node[str(dirpath.resolve())]
 
         for dirname in dirnames:
@@ -469,8 +476,8 @@ def show_tree(path: Path, /, full: bool = False) -> None:
         full (bool, optional): If true, also print contents of zip files.
     """
     tree: Tree = Tree.load(path, mapper=PathData.deserialize_mapper)
-    tree.name = path.name 
-    
+    tree.name = path.name
+
     if not full:
         slim_tree = tree.filtered(
             lambda n: SkipBranch(and_self=False) if n.data.is_zip else True
@@ -639,13 +646,16 @@ def upload(
             zip_path = Path(tmpdir) / object_key
             zip_path.parent.mkdir(exist_ok=True, parents=True)
 
-            with zipfile.ZipFile(zip_path, mode="w") as archive:
+            with zipfile.ZipFile(
+                zip_path, mode="w", compression=zipfile.ZIP_LZMA
+            ) as archive:
                 if (s3.bucket is not None or s3.prefix is not None) or keep:
                     for n in node.find_all(match=lambda n: n.is_leaf(), add_self=True):
                         archive.write(
                             n.data.path,
                             arcname=n.data.path.relative_to(node.data.path.parent),
                         )
+            node.data.zip_size = zip_path.stat().st_size
             update_fn(description=f"Uploading {node.data.path.name}")
             upload(zip_path, object_key)
         update_fn(advance=1)
@@ -654,7 +664,7 @@ def upload(
     for i, (prefix, tree) in enumerate(subtrees.items()):
         with Progress(
             TextColumn(
-                f"({i+1}/{len(subtrees)}) " + "[progress.description]{task.description}"
+                f"(Partition {i+1}/{len(subtrees)}) " + "[progress.description]{task.description}"
             ),
             BarColumn(),
             TaskProgressColumn(),
@@ -677,6 +687,15 @@ def upload(
             path / "trees" / f"{k or 'tree'}.json",
             mapper=PathData.serialize_mapper,
             compression=True,
+        )
+        root = st.first_child()
+        compressed_size = sum(
+            root.find_all(match=lambda n: n.data.zip_size(), add_self=True)
+        )
+        log.info(
+            f"Total file: {_bytes_to_str(root.data.size)}, "
+            f"Compressed size: {_bytes_to_str(compressed_size)}, "
+            f"Compression ratio: ({root.data.size/compressed_size:.1f}x)"
         )
 
 
