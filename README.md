@@ -385,3 +385,7 @@ Tree<'metadata.json'>
 *Tip:* To see the full details for each split, you can use the `show-tree` like so `python tools.py show-tree trees/visionsim50/frames.json --full`.
 
 </details>
+
+## Quanta Neural Networks: Simulated Datasets
+
+We include high-speed video sequences (at framerates of about 16 kFPS) and groundtruth annotations for three computer vision tasks: monocular depth estimation, multi-frame point tracking, and video restoration (for which the input high-speed sequences are the groundtruth itself). These high-speed sequences were used to simulate photon detections and train [Quanta Neural Networks](https://wisionlab.com/project/quanta-neural-networks/), published at ICCV 2025.
