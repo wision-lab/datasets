@@ -497,6 +497,7 @@ def upload(
     chunk_size: MemSize = _bytes_from_str("10GB"),
     exclude: list[str] = [],
     tmp_dir: Path | None = None,
+    trees_dir: Path | None = None,
     keep: bool = False,
     partitions: Path | None = None,
     min_zip_depth: int = 1,
@@ -515,6 +516,7 @@ def upload(
         tmp_dir (Path, optional): Location of scratch dir
             used to build archives. Useful if the `chunk_size` is more than a
             few GBs. Defaults to OS default tmp directory.
+        trees_dir (Path, optional): Location in which to save trees. Defaults to `path`. 
         keep (bool, optional): If true, the temporary directory is kept. Useful for
             debugging or for making a local archive instead of using S3 if
             S3 connection parameters are not set.
@@ -682,10 +684,10 @@ def upload(
             )
 
     # Save all subtrees for future inspection
-    (path / "trees").mkdir(exist_ok=True, parents=True)
+    ((trees_dir or path) / "trees").mkdir(exist_ok=True, parents=True)
     for k, st in subtrees.items():
         st.save(
-            path / "trees" / f"{k or 'tree'}.json",
+            (trees_dir or path) / "trees" / f"{k or 'tree'}.json",
             mapper=PathData.serialize_mapper,
             compression=True,
         )
