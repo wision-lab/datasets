@@ -389,3 +389,23 @@ Tree<'metadata.json'>
 ## Quanta Neural Networks: Simulated Datasets
 
 We include high-speed video sequences (at framerates of about 16 kFPS) and groundtruth annotations for three computer vision tasks: monocular depth estimation, multi-frame point tracking, and video restoration (for which the input high-speed sequences are the groundtruth itself). These high-speed sequences were used to simulate photon detections and train [Quanta Neural Networks](https://wisionlab.com/project/quanta-neural-networks/), published at ICCV 2025.
+
+To download these datasets, please use `DATASET_PREFIX=quanta-neural-networks`.
+
+<details>
+<summary>See Detailed Folder Structure</summary>
+
+```
+Tree<'tree.json'>
+╰── 💾 blender_depth_faster_0.zip (22.3G 1.1x)
+
+Tree<'tree.json'>
+╰── 💾 tracking_dataset_0.zip (8.7G 1.8x)
+
+Tree<'tree.json'>
+╰── 💾 xvfi_0.zip (1.7G 1.0x)
+```
+
+*Note:* The zip file sizes refer to the decompressed filesize.
+
+*Tip:* To see the full details for each split, you can use the `show-tree` like so `python tools.py show-tree trees/quanta-neural-networks/xvfi.json --full`.
