@@ -33,6 +33,9 @@ for zip in $(find $DOWNLOAD_DIR -type f -name *.zip); do 7z x $zip -o$(dirname $
 *Note:* If you are on UW-Madison wifi or connected to the campus VPN, downloads will be much faster.
 
 
+
+# Captured Datasets
+
 ## Quanta Vision Sequences
 
 Below we include folder-wise descriptions (of directories under `sequences`), paper(s) associated with the folder and hot-pixel masks per sequence. These real-world sequences were captured using the passive single photon cameras, high speed cameras, or other specialized cameras (event/low light cameras).
@@ -85,6 +88,88 @@ ROOT: quanta_vision/sequences
 ```
 
 *Note:* The zip file sizes refer to the decompressed filesize.
+
+</details>
+</br>
+
+# Simulated Datasets
+
+## Single Photon Reconstruction Challenge
+
+This dataset was created for an ongoing [single photon reconstruction challenge and competition](https://singlephotonchallenge.com/) and consists of
+photoncube/image pairs from 50 unique simulated scenes, plus another 5 scenes for the test set (for which ground
+truths are not made public). Each photoncube consists of 1024 bitplanes, and the associated ground truth
+reconstruction corresponds to the last bitplane. A sample of this dataset can be [downloaded here](https://drive.google.com/file/d/1wV5KnbexqOXVS69SfawPBZu0AVk-Tu_v/view?usp=sharing) (~3.5GB).
+
+To download the whole dataset (~425G training set + ~42G test set, ~133G and ~13G compressed respectively) use `DATASET_PREFIX=challenges/reconstruction`.
+
+<details>
+<summary>See Detailed Folder Structure</summary>
+
+```
+Tree<'train.json'>
+├── 💾 train_0.zip (8.5G 14.0x)
+├── 💾 train_1.zip (8.5G 4.1x)
+├── 💾 train_2.zip (8.5G 3.0x)
+├── 💾 train_3.zip (8.5G 4.1x)
+├── 💾 train_4.zip (8.5G 2.2x)
+├── 💾 train_5.zip (8.5G 22.1x)
+├── 💾 train_6.zip (8.5G 4.3x)
+├── 💾 train_7.zip (8.5G 5.3x)
+├── 💾 train_8.zip (8.5G 2.1x)
+├── 💾 train_9.zip (8.5G 2.3x)
+├── 💾 train_10.zip (8.5G 2.9x)
+├── 💾 train_11.zip (8.5G 6.1x)
+├── 💾 train_12.zip (8.5G 3.5x)
+├── 💾 train_13.zip (8.5G 3.6x)
+├── 💾 train_14.zip (8.5G 3.1x)
+├── 💾 train_15.zip (8.5G 2.3x)
+├── 💾 train_16.zip (8.5G 2.8x)
+├── 💾 train_17.zip (8.5G 5.3x)
+├── 💾 train_18.zip (8.5G 2.7x)
+├── 💾 train_19.zip (8.5G 2.6x)
+├── 💾 train_20.zip (8.5G 3.4x)
+├── 💾 train_21.zip (8.5G 4.4x)
+├── 💾 train_22.zip (8.5G 2.9x)
+├── 💾 train_23.zip (8.5G 3.2x)
+├── 💾 train_24.zip (8.5G 5.4x)
+├── 💾 train_25.zip (8.5G 3.4x)
+├── 💾 train_26.zip (8.5G 2.2x)
+├── 💾 train_27.zip (8.5G 4.2x)
+├── 💾 train_28.zip (8.5G 2.6x)
+├── 💾 train_29.zip (8.5G 2.2x)
+├── 💾 train_30.zip (8.5G 3.4x)
+├── 💾 train_31.zip (8.5G 2.9x)
+├── 💾 train_32.zip (8.5G 2.2x)
+├── 💾 train_33.zip (8.5G 2.4x)
+├── 💾 train_34.zip (8.5G 3.3x)
+├── 💾 train_35.zip (8.5G 2.6x)
+├── 💾 train_36.zip (8.5G 1.7x)
+├── 💾 train_37.zip (8.5G 3.9x)
+├── 💾 train_38.zip (8.5G 3.9x)
+├── 💾 train_39.zip (8.5G 3.7x)
+├── 💾 train_40.zip (8.5G 2.0x)
+├── 💾 train_41.zip (8.5G 5.1x)
+├── 💾 train_42.zip (8.5G 2.3x)
+├── 💾 train_43.zip (8.5G 5.2x)
+├── 💾 train_44.zip (8.5G 7.1x)
+├── 💾 train_45.zip (8.5G 2.3x)
+├── 💾 train_46.zip (8.5G 3.8x)
+├── 💾 train_47.zip (8.5G 2.5x)
+├── 💾 train_48.zip (8.5G 3.3x)
+╰── 💾 train_49.zip (8.5G 6.5x)
+
+Tree<'test.json'>
+├── 💾 test_0.zip (8.5G 8.8x)
+├── 💾 test_1.zip (8.5G 1.4x)
+├── 💾 test_2.zip (8.5G 9.7x)
+├── 💾 test_3.zip (8.5G 2.3x)
+╰── 💾 test_4.zip (8.5G 6.9x)
+```
+
+*Note:* The zip file sizes refer to the decompressed filesize, compression ratio is shown in parenthesis.
+
+*Tip:* To see the full details for each split, you can use the `show-tree` like so `python tools.py show-tree trees/challenges/reconstruction/test.json --full`.
 
 </details>
 
@@ -386,7 +471,7 @@ Tree<'metadata.json'>
 
 </details>
 
-## Quanta Neural Networks: Simulated Datasets
+## Quanta Neural Networks
 
 We include high-speed video sequences (at framerates of about 16 kFPS) and groundtruth annotations for three computer vision tasks: monocular depth estimation, multi-frame point tracking, and video restoration (for which the input high-speed sequences are the groundtruth itself). These high-speed sequences were used to simulate photon detections and train [Quanta Neural Networks](https://wisionlab.com/project/quanta-neural-networks/), published at ICCV 2025.
 
