@@ -1,3 +1,17 @@
+# /// script
+# requires-python = ">=3.14"
+# dependencies = [
+#     "boto3==1.35.31",
+#     "more-itertools",
+#     "natsort",
+#     "nutree",
+#     "questionary",
+#     "rich",
+#     "types-boto3[s3]",
+#     "tyro",
+# ]
+# ///
+
 # NOTE: For internal use only, this script is used to upload datasets to our S3 bucket,
 #   and will not work without proper auth tokens (i.e in ~/.aws/credentials).
 #
