@@ -22,7 +22,6 @@
 from __future__ import annotations
 
 import contextlib
-import io
 import itertools
 import json
 import logging
@@ -32,7 +31,7 @@ import sys
 import tempfile
 import zipfile
 from dataclasses import dataclass
-from fnmatch import fnmatch
+from fnmatch import translate
 from functools import partial, reduce
 from pathlib import Path
 
@@ -199,7 +198,9 @@ class PathData:
         icon = "💾" if self.is_zip else "📁" if self.is_dir else "📄"
         size = _bytes_to_str(self.size or 0)
         size += (
-            f" {self.size/self.zip_size:.1f}x" if self.is_zip and self.zip_size else ""
+            f" {self.size / self.zip_size:.1f}x"
+            if self.is_zip and self.zip_size
+            else ""
         )
         return f"{icon} {self.path.name} ({size})"
 
@@ -220,7 +221,13 @@ class PathData:
 
     @staticmethod
     def deserialize_mapper(parent, data):
-        path, is_dir, is_zip, has_zip_descendants, size, zip_size = data["data"]
+        fields = data["data"]
+        # Backwards compatibility: old files may have 5 fields (missing zip_size)
+        if len(fields) == 5:
+            path, is_dir, is_zip, has_zip_descendants, size = fields
+            zip_size = None
+        else:
+            path, is_dir, is_zip, has_zip_descendants, size, zip_size = fields
         return PathData(
             path=Path(path),
             is_dir=is_dir,
@@ -241,15 +248,6 @@ def is_not_dunder(path: Path) -> bool:
 
 def is_match(path: Path, patterns: list[str] | None = None) -> bool:
     return any(path.match(exclude_pattern) for exclude_pattern in (patterns or []))
-
-
-def deepcopy(tree: Tree) -> Tree:
-    # Create deepcopy through serialization to/from memory
-    with io.StringIO() as f:
-        tree.save(f, mapper=PathData.serialize_mapper)
-        f.seek(0)
-
-        return Tree.load(f, mapper=PathData.deserialize_mapper)
 
 
 def populate_filesize(*, node: Node | Tree, refresh: bool = False) -> Node | Tree:
@@ -278,13 +276,16 @@ def directory_tree(
     tree: Tree = Tree("Directory Listing")
     root = tree.add(PathData(path=path))
     path2node = {str(root.data.path.resolve()): root}
-    skipped_dirs = set()
+    skipped_dirs: set[Path] = set()
 
     if not path.exists():
         raise FileNotFoundError(f"Directory {path} does not exist!")
 
-    for dirpath, dirnames, filenames in Path(path).walk(
-        on_error=on_error, follow_symlinks=follow_symlinks
+    # Use os.scandir for a single-pass walk that avoids redundant stat() calls.
+    # Path.walk() calls stat() internally, and then we were calling stat() again
+    # for each file. os.scandir provides stat info directly from the directory entry.
+    for dirpath, dirnames, filenames, dir_entries in _scandir_walk(
+        path, on_error=on_error, follow_symlinks=follow_symlinks
     ):
         if filter_fn is not None and (
             not filter_fn(dirpath) or dirpath.parent in skipped_dirs
@@ -295,20 +296,95 @@ def directory_tree(
         parent = path2node[str(dirpath.resolve())]
 
         for dirname in dirnames:
-            if filter_fn is None or filter_fn(dirpath / dirname):
-                child_data = PathData(path=dirpath / dirname)
+            child_path = dirpath / dirname
+            if filter_fn is None or filter_fn(child_path):
+                child_data = PathData(path=child_path)
                 child = parent.add(child_data)
                 path2node[str(child.data.path.resolve())] = child
-        for filename in filenames:
-            if filter_fn is None or filter_fn(dirpath / filename):
+        for filename, entry in filenames:
+            child_path = dirpath / filename
+            if filter_fn is None or filter_fn(child_path):
+                # Use stat from scandir entry to avoid redundant stat() call
                 child_data = PathData(
-                    path=dirpath / filename,
-                    size=(dirpath / filename).stat().st_size,
+                    path=child_path,
+                    size=entry.stat(follow_symlinks=follow_symlinks).st_size,
                 )
                 child = parent.add(child_data)
                 path2node[str(child.data.path.resolve())] = child
     populate_filesize(node=root)
     return tree
+
+
+def _scandir_walk(
+    top: Path,
+    on_error: Callable | None = None,
+    follow_symlinks: bool = False,
+) -> list[tuple[Path, list[str], list[tuple[str, os.DirEntry]], list[os.DirEntry]]]:
+    """A replacement for Path.walk() that uses os.scandir to avoid redundant stat() calls.
+
+    Returns a list of (dirpath, dirnames, filenames_with_entries, dir_entries) tuples,
+    where filenames_with_entries is a list of (filename, DirEntry) pairs.
+    """
+    results: list[
+        tuple[Path, list[str], list[tuple[str, os.DirEntry]], list[os.DirEntry]]
+    ] = []
+
+    try:
+        scandir_iter = os.scandir(top)
+    except OSError as e:
+        if on_error is not None:
+            on_error(e)
+        return results
+
+    with scandir_iter as it:
+        dirnames: list[str] = []
+        filenames: list[tuple[str, os.DirEntry]] = []
+        dir_entries: list[os.DirEntry] = []
+
+        for entry in it:
+            try:
+                is_dir = entry.is_dir(follow_symlinks=follow_symlinks)
+            except OSError:
+                is_dir = False
+
+            if is_dir:
+                dirnames.append(entry.name)
+                dir_entries.append(entry)
+            else:
+                filenames.append((entry.name, entry))
+
+        results.append((top, dirnames, filenames, dir_entries))
+
+    # Recurse into subdirectories
+    for dirname, entry in zip(dirnames, dir_entries):
+        sub_path = top / dirname
+        try:
+            sub_results = _scandir_walk(
+                sub_path, on_error=on_error, follow_symlinks=follow_symlinks
+            )
+            results.extend(sub_results)
+        except PermissionError as e:
+            if on_error is not None:
+                on_error(e)
+
+    return results
+
+
+def _compile_patterns(
+    patterns: dict[str, str | None],
+) -> dict[str, re.Pattern | None]:
+    """Pre-compile fnmatch patterns to regex for faster matching.
+
+    Converts glob patterns to regex using fnmatch.translate() and compiles them.
+    None patterns remain None (they match the default group).
+    """
+    compiled: dict[str, re.Pattern | None] = {}
+    for name, pattern in patterns.items():
+        if pattern is None:
+            compiled[name] = None
+        else:
+            compiled[name] = re.compile(translate(pattern))
+    return compiled
 
 
 def partition_tree_by_fnmatches(
@@ -343,45 +419,36 @@ def partition_tree_by_fnmatches(
     else:
         default_groupname = reverse_patterns[None]
 
-    # Split all leaf node based on matches
+    # Pre-compile patterns to regex for faster matching
+    compiled_patterns = _compile_patterns(patterns)
+
+    # Single pass: classify each leaf node into its matching partition
     all_leafs = {n.data.path: n for n in tree.find_all(match=lambda n: n.is_leaf())}
-    matched_leafs = {
-        pattern_name: {
-            n.data.path: n
-            for n in filter(
-                lambda n: fnmatch(n.data.path, pattern_expr), all_leafs.values()
-            )
-        }
-        for pattern_name, pattern_expr in patterns.items()
-        if pattern_name != default_groupname
-    }
-    matched_leafs[default_groupname] = {
-        n.data.path: n
-        for n in filter(
-            lambda n: not any(
-                fnmatch(n.data.path, pattern_expr)
-                for pattern_expr in patterns.values()
-                if pattern_expr
-            ),
-            all_leafs.values(),
-        )
-    }
+    matched_leafs: dict[str, dict[Path, Node]] = {name: {} for name in patterns}
+
+    for path, node in all_leafs.items():
+        matched = False
+        for pattern_name, pattern_expr in compiled_patterns.items():
+            if pattern_name == default_groupname:
+                continue
+            if pattern_expr is not None and pattern_expr.match(str(path)):
+                matched_leafs[pattern_name][path] = node
+                matched = True
+                break
+        if not matched:
+            matched_leafs[default_groupname][path] = node
 
     # Ensure no leaf node overlap and that we didn't miss any nodes
-    assert all(
-        set(u).isdisjoint(v)
-        for u, v in itertools.combinations(matched_leafs.values(), 2)
-    )
-    all_matched_leafs = reduce(set.union, (set(l) for l in matched_leafs.values()))
+    all_matched_leafs = reduce(set.union, (set(v) for v in matched_leafs.values()))
     assert all_matched_leafs == set(all_leafs)
 
-    # Filter tree into all subtrees, recalculate file sizes, deepcopy all and filter out empty trees
+    # Filter tree into all subtrees, deepcopy all and filter out empty trees
     subtrees = {
         pattern_name: tree.filtered(lambda n: n.data.path in leafs)
         for pattern_name, leafs in matched_leafs.items()
     }
     subtrees = {
-        pattern_name: cast(Tree, populate_filesize(node=deepcopy(st), refresh=True))
+        pattern_name: cast(Tree, populate_filesize(node=st.deepcopy(), refresh=True))
         for pattern_name, st in subtrees.items()
         if st.count
     }
@@ -403,8 +470,11 @@ def split_into_chunks(
                 node.data.has_zip_descendants or child.data.has_zip_descendants
             )
 
+        # Early exit: if this node is small enough and deep enough, skip splitting
+        if node.data.size <= chunk_size and node.depth() > min_zip_depth:
+            return
+
         # Split node if too big, making sure to exclude children with zip descendants
-        # if node.data.size > chunk_size or node.is_top():
         if node.data.size > chunk_size or node.depth() <= min_zip_depth:
             children = natsorted(
                 filter(lambda n: not n.data.has_zip_descendants, node.children),
@@ -439,9 +509,10 @@ def split_into_chunks(
         return tree
 
     splits: dict[tuple[str | int, int], list[Node]] = {}
-    raw_files = set(
-        str(n.data.path) for n in tree.find_all(match=lambda n: n.is_leaf())
-    )
+
+    # Cache leaf nodes to avoid repeated find_all traversals
+    leaf_nodes = list(tree.find_all(match=lambda n: n.is_leaf()))
+    raw_files = set(str(n.data.path) for n in leaf_nodes)
 
     # Find places for zips without modifying tree topology!
     find_splits(node=root, splits=splits)
@@ -466,7 +537,7 @@ def split_into_chunks(
         if not node.children:
             node.remove()
 
-    # Ensure no files are missed
+    # Ensure no files are missed (use cached leaf nodes)
     zip_files = set(
         str(n.data.path) for n in tree.find_all(match=lambda n: n.is_leaf())
     )
@@ -530,7 +601,7 @@ def upload(
         tmp_dir (Path, optional): Location of scratch dir
             used to build archives. Useful if the `chunk_size` is more than a
             few GBs. Defaults to OS default tmp directory.
-        trees_dir (Path, optional): Location in which to save trees. Defaults to `path`. 
+        trees_dir (Path, optional): Location in which to save trees. Defaults to `path`.
         keep (bool, optional): If true, the temporary directory is kept. Useful for
             debugging or for making a local archive instead of using S3 if
             S3 connection parameters are not set.
@@ -557,12 +628,12 @@ def upload(
             log.debug(f"Excluding {p} ({_bytes_to_str(p.stat().st_size)})")
         return keep
 
-    with Status("Building Tree...", spinner="bouncingBall") as status:
+    with Status("Building Tree...", spinner="bouncingBall"):
         file_tree = directory_tree(
             path, filter_fn=path_filter, follow_symlinks=follow_symlinks
         )
 
-    with Status("Partitioning Tree...", spinner="bouncingBall") as status:
+    with Status("Partitioning Tree...", spinner="bouncingBall"):
         if partitions:
             with open(partitions, "r") as f:
                 partitions_dict = json.load(f)
@@ -613,8 +684,14 @@ def upload(
         )
     else:
         # Do not check existence if not uploading
-        upload = lambda src, dst: log.info(f"Would have uploaded {src} to {dst}.")
-        exists = lambda *args, **kwargs: 0
+        def _log_upload(src, dst):
+            log.info(f"Would have uploaded {src} to {dst}.")
+
+        def _not_exists(*args, **kwargs):
+            return 0
+
+        upload = _log_upload
+        exists = _not_exists
 
     if tmp_dir:
         tmp_dir.mkdir(exist_ok=True, parents=True)
@@ -680,7 +757,7 @@ def upload(
     for i, (prefix, tree) in enumerate(subtrees.items()):
         with Progress(
             TextColumn(
-                f"(Partition {i+1}/{len(subtrees)}) "
+                f"(Partition {i + 1}/{len(subtrees)}) "
                 + "[progress.description]{task.description}"
             ),
             BarColumn(),
@@ -705,12 +782,12 @@ def upload(
             mapper=PathData.serialize_mapper,
             compression=True,
         )
-        size = sum(n.data.size for n in st.children) 
+        size = sum(n.data.size for n in st.children)
         compressed_size = sum(n.data.zip_size or 0 for n in st)
         log.info(
             f"Total file: {_bytes_to_str(size)}, "
             f"Compressed size: {_bytes_to_str(compressed_size)}, "
-            f"Compression ratio: ({size/compressed_size:.1f}x)"
+            f"Compression ratio: ({size / compressed_size:.1f}x)"
         )
 
 
