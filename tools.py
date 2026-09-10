@@ -793,7 +793,7 @@ def upload(
         if not node.data.is_zip:
             return None
 
-        object_key = Path(prefix or "") / node.data.path.relative_to(path.parent)
+        object_key = Path(prefix or "") / node.data.path.relative_to(path.parent.resolve())
         update_fn(description=f"Compressing {node.data.path.name}")
 
         if not overwrite and (zip_size := exists(key=object_key)):
@@ -815,7 +815,7 @@ def upload(
                     for n in node.find_all(match=lambda n: n.is_leaf(), add_self=True):
                         archive.write(
                             n.data.path,
-                            arcname=n.data.path.relative_to(node.data.path.parent),
+                            arcname=n.data.path.relative_to(node.data.path.parent.resolve()),
                         )
             node.data.zip_size = zip_path.stat().st_size
             update_fn(description=f"Uploading {node.data.path.name}")
