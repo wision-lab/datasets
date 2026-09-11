@@ -2,6 +2,7 @@
 # requires-python = ">=3.14"
 # dependencies = [
 #     "boto3==1.35.31",
+#     "certifi",
 #     "more-itertools",
 #     "natsort",
 #     "nutree",
