@@ -30,10 +30,12 @@ import re
 import sys
 import tempfile
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from fnmatch import translate
 from functools import partial, reduce
 from pathlib import Path
+from typing import TYPE_CHECKING, Annotated, TypeAlias, cast
 
 import boto3
 import more_itertools as mitertools
@@ -54,13 +56,8 @@ from rich.progress import (
 from rich.status import Status
 from rich.traceback import install
 from typing_extensions import (
-    TYPE_CHECKING,
-    Annotated,
     Any,
-    Callable,
     Protocol,
-    TypeAlias,
-    cast,
 )
 from tyro.extras import SubcommandApp
 
@@ -535,7 +532,7 @@ def split_into_chunks(
 
     # Create new zipnodes for every zip
     for (data_id, i), group_children in splits.items():
-        node = tree.find(data_id=data_id)
+        node = tree.find_first(data_id=data_id)
         assert isinstance(node, Node)
 
         zipnode_data = PathData(
@@ -793,7 +790,9 @@ def upload(
         if not node.data.is_zip:
             return None
 
-        object_key = Path(prefix or "") / node.data.path.relative_to(path.parent.resolve())
+        object_key = Path(prefix or "") / node.data.path.relative_to(
+            path.parent.resolve()
+        )
         update_fn(description=f"Compressing {node.data.path.name}")
 
         if not overwrite and (zip_size := exists(key=object_key)):
@@ -815,7 +814,9 @@ def upload(
                     for n in node.find_all(match=lambda n: n.is_leaf(), add_self=True):
                         archive.write(
                             n.data.path,
-                            arcname=n.data.path.relative_to(node.data.path.parent.resolve()),
+                            arcname=n.data.path.relative_to(
+                                node.data.path.parent.resolve()
+                            ),
                         )
             node.data.zip_size = zip_path.stat().st_size
             update_fn(description=f"Uploading {node.data.path.name}")
