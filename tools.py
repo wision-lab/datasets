@@ -27,11 +27,9 @@ import itertools
 import json
 import logging
 import os
-import random
 import re
 import sys
 import tempfile
-import time
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -44,14 +42,7 @@ import boto3
 import more_itertools as mitertools
 import questionary
 import tyro
-from boto3.exceptions import S3UploadFailedError
-from botocore.exceptions import (
-    ClientError,
-    HTTPClientError,
-)
-from botocore.exceptions import (
-    ConnectionError as BotoConnectionError,
-)
+from botocore.exceptions import ClientError
 from natsort import natsort_key, natsorted
 from nutree import SkipBranch, StopTraversal, Tree
 from nutree.node import Node
@@ -167,90 +158,15 @@ class S3Connection:
     """Prefix path of s3 objects."""
 
 
-# Service-side error codes that indicate a transient failure worth retrying.
-_RETRYABLE_ERROR_CODES = frozenset(
-    {
-        "InternalError",
-        "PriorRequestNotComplete",
-        "RequestTimeout",
-        "RequestTimeoutException",
-        "RequestThrottled",
-        "RequestThrottledException",
-        "ServiceUnavailable",
-        "SlowDown",
-        "Throttling",
-        "ThrottlingException",
-        "TooManyRequestsException",
-    }
-)
-
-# Retry policy for S3 requests. Long-running uploads should not be aborted by a
-# single flaky connection, so transient failures are retried with exponential
-# backoff and jitter.
-_RETRY_ATTEMPTS = 5
-_RETRY_BASE_DELAY = 1.0
-_RETRY_MAX_DELAY = 60.0
-
-
-def _is_retryable_error(error: BaseException) -> bool:
-    """Return True if `error` is a transient failure that is worth retrying."""
-    # boto3's managed transfer wraps service-side errors while preserving the
-    # original exception as `__cause__`. Unwrap it to inspect the real error.
-    if isinstance(error, S3UploadFailedError):
-        error = error.__cause__ or error
-    # Transport-level failures: connection resets, timeouts and TLS handshake or
-    # certificate validation errors (e.g. the self-signed cert SSLError above).
-    # botocore wraps all of these in ConnectionError / HTTPClientError.
-    if isinstance(error, (BotoConnectionError, HTTPClientError)):
-        return True
-    # Service-side failures are only retried when they are throttling or 5xx.
-    if isinstance(error, ClientError):
-        response = error.response or {}
-        status = response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0)
-        code = response.get("Error", {}).get("Code", "")
-        return status >= 500 or status == 0 or code in _RETRYABLE_ERROR_CODES
-    return False
-
-
-def _retry(
-    fn: Callable[[], Any],
-    *,
-    description: str,
-    attempts: int = _RETRY_ATTEMPTS,
-    base_delay: float = _RETRY_BASE_DELAY,
-    max_delay: float = _RETRY_MAX_DELAY,
-) -> Any:
-    """Call `fn`, retrying transient failures with exponential backoff + jitter."""
-    for attempt in range(1, attempts + 1):
-        try:
-            return fn()
-        except Exception as e:
-            if attempt >= attempts or not _is_retryable_error(e):
-                raise
-            delay = min(max_delay, base_delay * 2 ** (attempt - 1))
-            delay += random.uniform(0.0, delay * 0.5)
-            log.warning(
-                f"{description} failed on attempt {attempt}/{attempts} with "
-                f"{type(e).__name__}: {e}. Retrying in {delay:.1f}s..."
-            )
-            time.sleep(delay)
-    raise AssertionError("Unreachable: `_retry` did not return or raise.")
-
-
 def check_exists(
     *, s3_client: S3Client, conn: S3Connection, key: str | os.PathLike
 ) -> int:
     if conn.bucket is None:
         raise ValueError("Bucket name not specified!")
-    bucket = conn.bucket
-    object_key = str(Path(conn.prefix or "") / key)
     try:
-        return _retry(
-            lambda: s3_client.head_object(Bucket=bucket, Key=object_key)[
-                "ContentLength"
-            ],
-            description=f"Checking {object_key}",
-        )
+        return s3_client.head_object(
+            Bucket=conn.bucket, Key=str(Path(conn.prefix or "") / key)
+        )["ContentLength"]
     except ClientError:
         return 0
 
@@ -265,24 +181,18 @@ def upload_file(
 ) -> None:
     if conn.bucket is None:
         raise ValueError("Bucket name not specified!")
-    bucket = conn.bucket
-    object_key = str(Path(conn.prefix or "") / dst)
-    extra_args = {"ACL": "public-read"} if public else {}
-    log.info(f"Uploading {src} as {dst}...")
     try:
-        _retry(
-            lambda: s3_client.upload_file(
-                str(src),
-                bucket,
-                object_key,
-                ExtraArgs=extra_args,
-            ),
-            description=f"Uploading {src} as {dst}",
+        log.info(f"Uploading {src} as {dst}...")
+        extra_args = {"ACL": "public-read"} if public else {}
+        s3_client.upload_file(
+            str(src),
+            conn.bucket,
+            str(Path(conn.prefix or "") / dst),
+            ExtraArgs=extra_args,
         )
-    except Exception as e:
-        log.error(f"Failed to upload {src} to {dst} after {_RETRY_ATTEMPTS} attempts.")
+    except ClientError as e:
+        log.error(f"Failed to upload {src} to {dst}.")
         log.error(e)
-        raise
 
 
 @dataclass
