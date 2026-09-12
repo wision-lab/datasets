@@ -42,6 +42,7 @@ import boto3
 import more_itertools as mitertools
 import questionary
 import tyro
+from botocore.config import Config
 from botocore.exceptions import ClientError
 from natsort import natsort_key, natsorted
 from nutree import SkipBranch, StopTraversal, Tree
@@ -156,6 +157,14 @@ class S3Connection:
     """Name of S3 bucket."""
     prefix: str | None = None
     """Prefix path of s3 objects."""
+
+
+# Retry configuration for S3 requests. botocore's default `legacy` retry mode
+# does not retry TLS handshake / certificate validation errors (SSLError), so a
+# single flaky connection can abort an otherwise long upload. `standard` mode
+# treats ConnectionError / HTTPClientError as transient and retries them with
+# exponential backoff, jitter and a retry quota.
+_S3_RETRY_CONFIG = Config(retries={"mode": "standard", "total_max_attempts": 10})
 
 
 def check_exists(
@@ -744,7 +753,7 @@ def upload(
         public = questionary.confirm(
             "Make uploaded artifacts public?", default=False
         ).ask()
-        s3_client = boto3.client("s3")
+        s3_client = boto3.client("s3", config=_S3_RETRY_CONFIG)
         exists: Callable = partial(check_exists, s3_client=s3_client, conn=s3)
         upload: Callable = partial(
             upload_file, s3_client=s3_client, conn=s3, public=public
