@@ -37,6 +37,7 @@ from fnmatch import translate
 from functools import partial, reduce
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, TypeAlias, cast
+from urllib.parse import quote
 
 import boto3
 import more_itertools as mitertools
@@ -76,6 +77,13 @@ logging.getLogger("PIL").setLevel(logging.WARNING)
 log = logging.getLogger("rich")
 install(suppress=[tyro])
 app = SubcommandApp()
+
+# At most one of `--tmp-dir` / `--output-dir` may be set: the former is scratch
+# space that is cleaned up after each archive is built, while the latter is a
+# persistent local copy of the archives. See the `upload` command.
+_ARCHIVE_LOCATION_GROUP = tyro.conf.create_mutex_group(
+    required=False, title="archive location"
+)
 
 _SIZE_SYMBOLS = ("B", "K", "M", "G", "T", "P", "E", "Z", "Y")
 _SIZE_BOUNDS = [(1024**i, sym) for i, sym in enumerate(_SIZE_SYMBOLS)]
@@ -176,8 +184,17 @@ def check_exists(
         return s3_client.head_object(
             Bucket=conn.bucket, Key=str(Path(conn.prefix or "") / key)
         )["ContentLength"]
-    except ClientError:
-        return 0
+    except ClientError as e:
+        # A missing object simply means it does not exist yet. Any other error
+        # (e.g. 403, bad credentials, wrong bucket/region) must NOT be silently
+        # treated as "absent", otherwise the upload would proceed as though it
+        # were safe to (over)write a key it may not actually own.
+        response = e.response or {}
+        error_code = str(response.get("Error", {}).get("Code", ""))
+        status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if error_code in {"404", "NoSuchKey", "NotFound"} or status == 404:
+            return 0
+        raise
 
 
 def upload_file(
@@ -221,7 +238,7 @@ class PathData:
         icon = "💾" if self.is_zip else "📁" if self.is_dir else "📄"
         size = _bytes_to_str(self.size or 0)
         size += (
-            f" {self.size / self.zip_size:.1f}x"
+            f" {(self.size or 0) / self.zip_size:.1f}x"
             if self.is_zip and self.zip_size
             else ""
         )
@@ -431,6 +448,10 @@ def partition_tree_by_fnmatches(
     Returns:
         dict[str, Tree]: Maps a pattern name to it's matching subtree
     """
+    # Work on a copy so adding/renaming the default group below does not mutate
+    # the caller's dictionary.
+    patterns = dict(patterns)
+
     # Ensure there's a default group
     reverse_patterns = {v: k for k, v in patterns.items()}
 
@@ -611,13 +632,17 @@ def show_tree(
                 except ValueError:
                     current = None
             parts.reverse()
-            # Join all path components to form the relative S3 key
+            # Join all path components to form the relative S3 key, then
+            # percent-encode it (keeping "/" separators) so names containing
+            # spaces, "#", "?" etc. produce valid, clickable URLs.
             zip_rel_path = "/".join(parts)
-            url = f"https://web.s3.wisc.edu/public-datasets/{s3_prefix}/{zip_rel_path}"
+            url = "https://web.s3.wisc.edu/public-datasets/" + quote(
+                f"{s3_prefix}/{zip_rel_path}", safe="/"
+            )
             icon = "💾"
             size = _bytes_to_str(node.data.size or 0)
             size += (
-                f" {node.data.size / node.data.zip_size:.1f}x"
+                f" {(node.data.size or 0) / node.data.zip_size:.1f}x"
                 if node.data.zip_size
                 else ""
             )
@@ -657,9 +682,9 @@ def upload(
     s3: S3Connection = S3Connection(),
     chunk_size: MemSize = _bytes_from_str("10GB"),
     exclude: list[str] = [],
-    tmp_dir: Path | None = None,
+    tmp_dir: Annotated[Path | None, _ARCHIVE_LOCATION_GROUP] = None,
+    output_dir: Annotated[Path | None, _ARCHIVE_LOCATION_GROUP] = None,
     trees_dir: Path | None = None,
-    keep: bool = False,
     partitions: Path | None = None,
     min_zip_depth: int = 1,
     follow_symlinks: bool = False,
@@ -674,13 +699,16 @@ def upload(
         exclude (list[str], optional): Space separated list of path exclusion
             patterns. Warning something like "logs/" will match any path that
             contains logs. Internally uses `Path.match`.
-        tmp_dir (Path, optional): Location of scratch dir
-            used to build archives. Useful if the `chunk_size` is more than a
-            few GBs. Defaults to OS default tmp directory.
+        tmp_dir (Path, optional): Location of scratch dir used to build
+            archives. Useful if the `chunk_size` is more than a few GBs. Defaults
+            to the OS default tmp directory. Its contents are deleted once each
+            archive has been built. Mutually exclusive with `output_dir`.
+        output_dir (Path, optional): Directory into which archives are written,
+            mirroring the S3 object-key layout. Unlike `tmp_dir`, its contents
+            are never deleted, so it can be used to produce a local copy of the
+            dataset (e.g. when no S3 bucket/prefix is set). Mutually exclusive
+            with `tmp_dir`.
         trees_dir (Path, optional): Location in which to save trees. Defaults to `path`.
-        keep (bool, optional): If true, the temporary directory is kept. Useful for
-            debugging or for making a local archive instead of using S3 if
-            S3 connection parameters are not set.
         partitions (Path, optional): Path of json file containing partition names,
             their matching patterns and optionally a per-partition `min_zip_depth`.
         min_zip_depth (int, optional): Allow for zipping a node if it is
@@ -695,6 +723,11 @@ def upload(
     if min_zip_depth <= 0:
         raise ValueError("Argument `min_zip_depth` must be at least 1.")
 
+    # Also enforced by the `_ARCHIVE_LOCATION_GROUP` tyro marker; kept here so
+    # programmatic callers get the same guarantee.
+    if output_dir is not None and tmp_dir is not None:
+        raise ValueError("Arguments `output_dir` and `tmp_dir` are mutually exclusive.")
+
     # Create filesystem tree and split it into zip-sized chunks
     def path_filter(p):
         keep = (
@@ -704,9 +737,17 @@ def upload(
             log.debug(f"Excluding {p} ({_bytes_to_str(p.stat().st_size)})")
         return keep
 
+    def on_error(e: OSError) -> None:
+        # Surface walk errors (e.g. permission denied) instead of silently
+        # dropping a subtree and uploading an incomplete archive.
+        log.warning(f"Failed to walk part of {path}: {e}")
+
     with Status("Building Tree...", spinner="bouncingBall"):
         file_tree = directory_tree(
-            path, filter_fn=path_filter, follow_symlinks=follow_symlinks
+            path,
+            on_error=on_error,
+            filter_fn=path_filter,
+            follow_symlinks=follow_symlinks,
         )
 
     with Status("Partitioning Tree...", spinner="bouncingBall"):
@@ -716,7 +757,7 @@ def upload(
         else:
             partitions_dict = {"": {"pattern": None}}
 
-        patterns = {k: v["pattern"] for k, v in partitions_dict.items()}
+        patterns = {k: v.get("pattern") for k, v in partitions_dict.items()}
         subtrees = partition_tree_by_fnmatches(tree=file_tree, patterns=patterns)
 
     with Status(
@@ -769,19 +810,17 @@ def upload(
         upload = _log_upload
         exists = _not_exists
 
-    if tmp_dir:
-        tmp_dir.mkdir(exist_ok=True, parents=True)
-    if keep and tmp_dir:
-        # Use user-supplied tmp_dir directly, do not delete anything from it
-        context = partial(contextlib.nullcontext, enter_result=tmp_dir.resolve())
-    elif keep and tmp_dir is None:
-        # Use a single tmpdir, open context manager here and keep contents
-        with tempfile.TemporaryDirectory(delete=False) as tmpdir:
-            context = partial(contextlib.nullcontext, enter_result=tmpdir)
-            log.info(f"Using tempdir {tmpdir}")
-    elif not keep:
-        # We're not keeping the tempdir, so we can safely re-enter into a new
-        # temporary directory every time which helps keep it a manageable size
+    if output_dir is not None:
+        # Write archives straight into output_dir, mirroring the object-key
+        # layout. Its contents are never deleted, which makes this the reliable
+        # way to produce a local archive.
+        output_dir.mkdir(exist_ok=True, parents=True)
+        context = partial(contextlib.nullcontext, enter_result=output_dir.resolve())
+    else:
+        # We're not persisting anything, so we can safely re-enter into a new
+        # temporary directory every time which helps keep it a manageable size.
+        if tmp_dir is not None:
+            tmp_dir.mkdir(exist_ok=True, parents=True)
         context = partial(
             cast(Callable, tempfile.TemporaryDirectory),
             dir=tmp_dir.resolve() if tmp_dir is not None else None,
@@ -820,7 +859,11 @@ def upload(
             with zipfile.ZipFile(
                 zip_path, mode="w", compression=zipfile.ZIP_LZMA
             ) as archive:
-                if (s3.bucket is not None or s3.prefix is not None) or keep:
+                if (
+                    s3.bucket is not None
+                    or s3.prefix is not None
+                    or output_dir is not None
+                ):
                     for n in node.find_all(match=lambda n: n.is_leaf(), add_self=True):
                         archive.write(
                             n.data.path,
