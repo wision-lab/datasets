@@ -94,6 +94,10 @@ _SIZE_BOUNDS = [(1024**i, sym) for i, sym in enumerate(_SIZE_SYMBOLS)]
 _SIZE_DICT = {sym: val for val, sym in _SIZE_BOUNDS}
 _SIZE_RANGES = list(zip(_SIZE_BOUNDS, _SIZE_BOUNDS[1:]))
 
+# Size of the buffers files are streamed into archives with. Also the granularity
+# at which per-chunk compression progress is reported.
+_ZIP_BUFFER_SIZE = 1 << 20  # 1 MiB
+
 # Map Unicode box-drawing tree connector characters (╰──, ├──, │, …) to their
 # HTML numeric character references, so trees can be pasted directly inside a
 # <details> tag without relying on the HTML file's encoding.
@@ -778,6 +782,36 @@ def show_tree(
     print(output)
 
 
+def write_zip_stream(
+    archive: zipfile.ZipFile,
+    src: Path,
+    *,
+    arcname: str | os.PathLike,
+    on_bytes: Callable[[int], None] | None = None,
+) -> None:
+    """Add `src` to `archive` under `arcname`, streaming it in fixed-size buffers.
+
+    Equivalent to `ZipFile.write` (same LZMA compression, mtime and permission
+    metadata) except that `on_bytes` is invoked with the number of raw bytes
+    written after each buffer, so callers can report progress that advances even
+    within a single large file.
+
+    Note:
+        `ZipInfo.from_file` defaults to `ZIP_STORED`, so the archive's compression
+        must be copied onto the entry explicitly (as `ZipFile.write` does), else
+        the data would be stored uncompressed. Zip64 is enabled automatically for
+        large files because `from_file` records the source size.
+    """
+    zinfo = zipfile.ZipInfo.from_file(src, arcname)
+    zinfo.compress_type = archive.compression
+    zinfo._compresslevel = archive.compresslevel
+    with open(src, "rb") as fileobj, archive.open(zinfo, "w") as dest:
+        while chunk := fileobj.read(_ZIP_BUFFER_SIZE):
+            dest.write(chunk)
+            if on_bytes is not None:
+                on_bytes(len(chunk))
+
+
 def _default_upload_workers(
     *, chunk_size: int, output_dir: Path | None, tmp_dir: Path | None
 ) -> int:
@@ -1048,17 +1082,17 @@ def upload(
                         or s3.prefix is not None
                         or output_dir is not None
                     ):
+                        zip_root = node.data.path.parent.resolve()
                         for n in node.find_all(
                             match=lambda n: n.is_leaf(), add_self=True
                         ):
-                            archive.write(
+                            # Byte-smooth progress, even within a single large file.
+                            write_zip_stream(
+                                archive,
                                 n.data.path,
-                                arcname=n.data.path.relative_to(
-                                    node.data.path.parent.resolve()
-                                ),
+                                arcname=n.data.path.relative_to(zip_root),
+                                on_bytes=lambda written: tick(advance=written),
                             )
-                            # Coarse progress: advance by each archived file's size.
-                            tick(advance=n.data.size or 0)
                 node.data.zip_size = zip_path.stat().st_size
 
                 if uploading:
