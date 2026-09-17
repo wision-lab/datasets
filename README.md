@@ -38,7 +38,7 @@ for zip in $(find $DOWNLOAD_DIR -type f -name *.zip); do 7z x $zip -o$(dirname $
 
 ## Quanta Vision Sequences
 
-Below we include folder-wise descriptions (of directories under `sequences`), paper(s) associated with the folder and hot-pixel masks per sequence. These real-world sequences were captured using the passive single photon cameras, high speed cameras, or other specialized cameras (event/low light cameras).
+Below we include folder-wise descriptions (of directories under `sequences`), paper(s) associated with the folder and hot-pixel masks per sequence. These real-world sequences were captured using the passive single photon cameras, high speed cameras, or other specialized cameras (event/low light cameras). To download these  dataset use `DATASET_PREFIX=quantavision/<PAPER-ID>` where `PAPER-ID` is `anycam`, `pano`, etc.
 
 * `anycam`: sequences associated with [Sundar et al., ICCV 2023](https://openaccess.thecvf.com/content/ICCV2023/html/Sundar_SoDaCam_Software-defined_Cameras_via_Single-Photon_Imaging_ICCV_2023_paper.html).  All sequences were captured at 96.8 kHz. Associated hot-pixel mask is `hot_pixel_mask/SwissSPAD_ddr3_mode.npy` for sequences captured by the SPAD with no color filter array and `hot_pixel_mask/colorSPAD_continuous_stream.npy` for the rest.  See `arguments.json` in each folder that contains a `binary.npy` file for discerning which is which. Alternatively, the mean-frame video gives it away (ones that use a CFA have a conspicuous mosaic pattern). When using the color-filter array captured sequences, we impute out the pixels corresponding to "R", "G", and "B" filters; these are a minority and make up just 6.25% of the overall pixel count.
 * `color`: sequences associated with [Ma et al., SIGGRAPH 2023](https://dl.acm.org/doi/10.1145/3592438). Sequences were captured at 16 kHz (unless annotated otherwise) and use the hotpixel mask in `hot_pixel_mask/colorSPAD_continuous_stream.npy`. See `color_filter_array/rgbw_oh_bn_color_ss2_padded.tif` for a specification of the random RGBW CFA pattern.
@@ -46,6 +46,8 @@ Below we include folder-wise descriptions (of directories under `sequences`), pa
 * `photoev`: sequences associated with [Sundar et al., CVPR 2024](https://arxiv.org/abs/2407.02683). All sequences were captured at 96.8 kHz. Hot pixel masks are `hot_pixel_mask/new_graySPAD_continuous_stream.npy` for sequences captured by the SPAD with no CFAs and `hot_pixel_mask/colorSPAD_continuous_stream.npy` otherwise.
 * `qbp`: sequences associated with [Ma et al., SIGGRAPH 2020](https://arxiv.org/abs/2006.11840). Hotpixel mask for all sequences is `hot_pixel_mask/SwissSPAD_ddr3_mode.npy`. Sequences captured at 10--16 kHz.
 * `vision`: sequences associated with [Ma et al., WACV 2023](https://openaccess.thecvf.com/content/WACV2023/papers/Ma_Burst_Vision_Using_Single-Photon_Cameras_WACV_2023_paper.pdf). Hotpixel mask for all sequences is `hot_pixel_mask/SwissSPAD_continuous_stream.npy`. Most sequences were captured at 10--16 kHz.
+
+*Update 09/2026:* These datasets were moved from `DATASET_PREFIX=quanta-vision/sequences/*` to `DATASET_PREFIX=quantavision/*` to conform with the updated upload scripts, the individual trees have also been pushed to this repo.
 
 <details>
 <summary>See Detailed Folder Structure</summary>

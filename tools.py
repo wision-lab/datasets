@@ -28,10 +28,12 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 import tempfile
 import zipfile
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from fnmatch import translate
 from functools import partial, reduce
@@ -52,6 +54,8 @@ from rich.logging import RichHandler
 from rich.progress import (
     BarColumn,
     Progress,
+    ProgressColumn,
+    TaskID,
     TaskProgressColumn,
     TextColumn,
     TimeRemainingColumn,
@@ -119,6 +123,101 @@ class UpdateFn(Protocol):
         visible: bool | None = None,
         refresh: bool = False,
     ) -> None: ...
+
+
+class UploadProgress(Progress):
+    """Progress display for concurrently zipped/uploaded chunks.
+
+    A port of the `PoolProgress` helper used elsewhere in the project, adapted to
+    threads: it renders an aggregate "Overall progress" bar alongside one bar per
+    in-flight chunk (never more than the number of workers). Chunk bars are
+    hidden until a worker starts them and hidden again once they finish, so the
+    display stays bounded regardless of how many archives there are.
+
+    Unlike the multiprocessing original this needs no `Manager`/`Queue`: worker
+    threads update `rich` directly, since `Progress.update`/`advance` are already
+    lock-protected.
+    """
+
+    def __init__(
+        self,
+        *args,
+        auto_visible: bool = True,
+        description: str = "[green]Overall progress:",
+        **kwargs,
+    ) -> None:
+        """
+        Args:
+            auto_visible (bool, optional): If true, chunk bars are hidden until a
+                worker first updates them and are hidden again once it finishes.
+                Defaults to True.
+            description (str, optional): Description shown on the overall bar.
+        """
+        self.overall_taskid: TaskID | None = None
+        self.inflight_tasks: set[TaskID] = set()
+        self.completed_tasks: set[TaskID] = set()
+        self.auto_visible = auto_visible
+        self.description = description
+        super().__init__(*args, **kwargs)
+
+    @classmethod
+    def get_default_columns(cls) -> tuple[ProgressColumn, ...]:
+        """Columns matching the rest of the script (elapsed time when finished)."""
+        return (
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeRemainingColumn(elapsed_when_finished=True),
+        )
+
+    def __enter__(self) -> UploadProgress:
+        self.start()
+        self.overall_taskid = super().add_task(self.description, total=0)
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        super().__exit__(*exc_info)
+
+    def add_task(self, *args, **kwargs) -> UpdateFn:  # type: ignore[override]
+        """Add a chunk task, returning a curried callback used to update it.
+
+        The task is created hidden (when `auto_visible`) and only becomes visible
+        once a worker calls the returned callback for the first time.
+        """
+        if self.auto_visible:
+            kwargs["visible"] = False
+        task_id = super().add_task(*args, **kwargs)
+        with self._lock:
+            self.inflight_tasks.add(task_id)
+            self._update_overall()
+        return partial(self.update, task_id)
+
+    def update(self, task_id: TaskID, **kwargs) -> None:  # type: ignore[override]
+        """Update a task, auto-showing it and folding completions into the overall bar.
+
+        A chunk is considered finished when its callback is called with
+        `visible=False`, which is what worker threads do once they are done.
+        """
+        kwargs.setdefault("visible", True)
+        super().update(task_id, **kwargs)
+        with self._lock:
+            if task_id == self.overall_taskid:
+                return
+            if kwargs.get("visible") is False:
+                self.inflight_tasks.discard(task_id)
+                self.completed_tasks.add(task_id)
+            self._update_overall()
+
+    def _update_overall(self) -> None:
+        """Refresh the overall bar from finished chunks plus in-flight fractions."""
+        if self.overall_taskid is None:
+            return
+        inflight = sum(self._tasks[t].percentage / 100 for t in self.inflight_tasks)
+        super().update(
+            self.overall_taskid,
+            completed=len(self.completed_tasks) + inflight,
+            total=len(self.completed_tasks) + len(self.inflight_tasks),
+        )
 
 
 def _bytes_from_str(size: str | list[str]) -> int:
@@ -204,6 +303,7 @@ def upload_file(
     s3_client: S3Client,
     conn: S3Connection,
     public: bool = True,
+    callback: Callable | None = None,
 ) -> None:
     if conn.bucket is None:
         raise ValueError("Bucket name not specified!")
@@ -215,6 +315,9 @@ def upload_file(
             conn.bucket,
             str(Path(conn.prefix or "") / dst),
             ExtraArgs=extra_args,
+            # boto3 invokes `callback(bytes_transferred)` intermittently during
+            # the transfer, which drives the per-chunk upload progress bar.
+            Callback=callback,
         )
     except ClientError as e:
         log.error(f"Failed to upload {src} to {dst}.")
@@ -675,6 +778,52 @@ def show_tree(
     print(output)
 
 
+def _default_upload_workers(
+    *, chunk_size: int, output_dir: Path | None, tmp_dir: Path | None
+) -> int:
+    """Pick a default number of upload workers when none is given.
+
+    With `output_dir` the archives are retained, so free disk space does not
+    bound the total footprint and we simply use every core. With a scratch dir
+    (`tmp_dir` or the OS temp dir) each archive is deleted right after upload, so
+    at most `workers` archives coexist on disk; spending only half of
+    the free space on them keeps the worker count within the available space.
+    """
+    cpu_count = os.cpu_count() or 1
+
+    if output_dir is not None:
+        log.warning(
+            "`workers` was not specified and `--output-dir` retains "
+            f"archives, so free space is not a usable bound: using {cpu_count} "
+            "worker(s) (one per core). Pass `--workers` to override."
+        )
+        return cpu_count
+
+    scratch = tmp_dir if tmp_dir is not None else Path(tempfile.gettempdir())
+    # The scratch dir may not exist yet; probe the nearest existing ancestor.
+    probe = scratch.resolve()
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+
+    free = shutil.disk_usage(probe).free
+    budget = free // 2
+    by_space = max(1, budget // chunk_size)
+    workers = min(by_space, cpu_count)
+
+    log.warning(
+        f"`workers` was not specified: using {workers} worker(s) "
+        f"({by_space} chunk(s) of {_bytes_to_str(chunk_size)} fit in half of the "
+        f"{_bytes_to_str(free)} free at {probe}, capped by {cpu_count} core(s)). "
+        "Pass `--workers` to override."
+    )
+    if budget < chunk_size:
+        log.warning(
+            f"Scratch space at {probe} may be too small for a single "
+            f"{_bytes_to_str(chunk_size)} archive; freeing space is recommended."
+        )
+    return workers
+
+
 @app.command
 def upload(
     path: Path,
@@ -689,6 +838,7 @@ def upload(
     min_zip_depth: int = 1,
     follow_symlinks: bool = False,
     overwrite: bool = False,
+    workers: int | None = None,
 ) -> None:
     """Auto-partition dataset into archives and upload them to an S3 bucket.
 
@@ -719,6 +869,11 @@ def upload(
         overwrite (bool, optional): If true, objects in the S3 bucket will be
             overwritten by new ones that share the same key, otherwise the
             conflicting uploads are skipped.
+        workers (int, optional): Maximum number of archives to zip and
+            upload concurrently. Archives are independent, so raising this
+            overlaps compression (CPU-bound) with uploads (I/O-bound). When left
+            unset it is derived from the free space of the scratch/output dir and
+            the number of cores, and a warning reports the chosen value.
     """
     if min_zip_depth <= 0:
         raise ValueError("Argument `min_zip_depth` must be at least 1.")
@@ -727,6 +882,9 @@ def upload(
     # programmatic callers get the same guarantee.
     if output_dir is not None and tmp_dir is not None:
         raise ValueError("Arguments `output_dir` and `tmp_dir` are mutually exclusive.")
+
+    if workers is not None and workers < 1:
+        raise ValueError("Argument `workers` must be at least 1.")
 
     # Create filesystem tree and split it into zip-sized chunks
     def path_filter(p):
@@ -784,7 +942,8 @@ def upload(
         sys.exit(1)
 
     # Confirm all s3 settings, ensure we don't accidentally upload anything
-    if s3.bucket is not None and s3.prefix is not None:
+    uploading = s3.bucket is not None and s3.prefix is not None
+    if uploading:
         if not questionary.confirm(
             "Not running in local mode, this will upload artifacts to S3. Confirm?",
             default=False,
@@ -827,75 +986,118 @@ def upload(
             delete=True,
         )
 
-    # Callable used to visit tree, will zip up all descendant of a zip node and upload it
-    def upload_ziptree(
+    # Worker count defaults to one derived from scratch space and core count.
+    if workers is None:
+        workers = _default_upload_workers(
+            chunk_size=chunk_size, output_dir=output_dir, tmp_dir=tmp_dir
+        )
+
+    # Traverse each partition once and tag every top-level zip node. Descendants
+    # of a zip node are skipped (a zip node subsumes its whole subtree), so the
+    # tagged archives are mutually independent. Collecting them up-front, rather
+    # than zipping during the walk, is what allows the worker pool below to build
+    # and upload several archives concurrently.
+    def collect_zipnodes(
         node: Node,
-        memo: Any,
+        _memo: Any,
         *,
         prefix: str | None,
-        context: Callable,
-        update_fn: UpdateFn,
+        jobs: list[tuple[str | None, Node]],
     ) -> SkipBranch | None:
-        if not node.data.is_zip:
-            return None
-
-        object_key = Path(prefix or "") / node.data.path.relative_to(
-            path.parent.resolve()
-        )
-        update_fn(description=f"Compressing {node.data.path.name}")
-
-        if not overwrite and (zip_size := exists(key=object_key)):
-            log.info(
-                f"Skipping {object_key} as objects with the same key exists in bucket."
-            )
-            node.data.zip_size = zip_size
-            update_fn(advance=1)
+        if node.data.is_zip:
+            jobs.append((prefix, node))
             raise SkipBranch
+        return None
 
-        with context() as tmpdir:
-            zip_path = Path(tmpdir) / object_key
-            zip_path.parent.mkdir(exist_ok=True, parents=True)
+    zip_jobs: list[tuple[str | None, Node]] = []
+    for prefix, tree in subtrees.items():
+        tree.visit(partial(collect_zipnodes, prefix=prefix, jobs=zip_jobs))
 
-            with zipfile.ZipFile(
-                zip_path, mode="w", compression=zipfile.ZIP_LZMA
-            ) as archive:
-                if (
-                    s3.bucket is not None
-                    or s3.prefix is not None
-                    or output_dir is not None
-                ):
-                    for n in node.find_all(match=lambda n: n.is_leaf(), add_self=True):
-                        archive.write(
-                            n.data.path,
-                            arcname=n.data.path.relative_to(
-                                node.data.path.parent.resolve()
-                            ),
-                        )
-            node.data.zip_size = zip_path.stat().st_size
-            update_fn(description=f"Uploading {node.data.path.name}")
-            upload(zip_path, object_key)
-        update_fn(advance=1)
-        raise SkipBranch
-
-    for i, (prefix, tree) in enumerate(subtrees.items()):
-        with Progress(
-            TextColumn(
-                f"(Partition {i + 1}/{len(subtrees)}) "
-                + "[progress.description]{task.description}"
-            ),
-            BarColumn(),
-            TaskProgressColumn(),
-            TimeRemainingColumn(elapsed_when_finished=True),
-        ) as progress:
-            task = progress.add_task(
-                "", total=len(tree.find_all(match=lambda n: n.data.is_zip))
+    # Zips up every descendant of a zip node and uploads the result. Runs in a
+    # worker thread, so it only touches node-local state (`node.data.zip_size`)
+    # and the thread-safe `tick` callback; no two workers share an archive.
+    def zip_and_upload(
+        prefix: str | None,
+        node: Node,
+        tick: UpdateFn,
+        *,
+        context: Callable,
+    ) -> None:
+        try:
+            object_key = Path(prefix or "") / node.data.path.relative_to(
+                path.parent.resolve()
             )
-            update_fn = partial(progress.update, task)
-            tree.visit(
-                partial(
-                    upload_ziptree, prefix=prefix, context=context, update_fn=update_fn
+            tick(description=f"Compressing {node.data.path.name}")
+
+            if not overwrite and (zip_size := exists(key=object_key)):
+                log.info(
+                    f"Skipping {object_key} as objects with the same key exists in bucket."
                 )
-            )
+                node.data.zip_size = zip_size
+                return
+
+            with context() as tmpdir:
+                zip_path = Path(tmpdir) / object_key
+                zip_path.parent.mkdir(exist_ok=True, parents=True)
+
+                with zipfile.ZipFile(
+                    zip_path, mode="w", compression=zipfile.ZIP_LZMA
+                ) as archive:
+                    if (
+                        s3.bucket is not None
+                        or s3.prefix is not None
+                        or output_dir is not None
+                    ):
+                        for n in node.find_all(
+                            match=lambda n: n.is_leaf(), add_self=True
+                        ):
+                            archive.write(
+                                n.data.path,
+                                arcname=n.data.path.relative_to(
+                                    node.data.path.parent.resolve()
+                                ),
+                            )
+                            # Coarse progress: advance by each archived file's size.
+                            tick(advance=n.data.size or 0)
+                node.data.zip_size = zip_path.stat().st_size
+
+                if uploading:
+                    # Reset the bar for the upload phase: its total switches from
+                    # the pre-compression size to the archive's on-disk size.
+                    tick(
+                        description=f"Uploading {node.data.path.name}",
+                        total=node.data.zip_size,
+                        completed=0,
+                    )
+                    upload(
+                        zip_path,
+                        object_key,
+                        callback=lambda transferred: tick(advance=transferred),
+                    )
+        finally:
+            # Hide the chunk bar and fold it into the overall progress bar.
+            tick(visible=False)
+
+    if zip_jobs:
+        with UploadProgress() as progress:
+            ticks = [
+                progress.add_task(
+                    f"Compressing {node.data.path.name}", total=node.data.size or 0
+                )
+                for _, node in zip_jobs
+            ]
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [
+                    executor.submit(zip_and_upload, prefix, node, tick, context=context)
+                    for (prefix, node), tick in zip(zip_jobs, ticks)
+                ]
+                failures = [
+                    error
+                    for future in as_completed(futures)
+                    if (error := future.exception()) is not None
+                ]
+            if failures:
+                raise failures[0]
 
     # Save all subtrees for future inspection
     ((trees_dir or path) / "trees").mkdir(exist_ok=True, parents=True)
