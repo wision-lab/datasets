@@ -98,6 +98,14 @@ _SIZE_RANGES = list(zip(_SIZE_BOUNDS, _SIZE_BOUNDS[1:]))
 # at which per-chunk compression progress is reported.
 _ZIP_BUFFER_SIZE = 1 << 20  # 1 MiB
 
+# Size of each individual read from the source. Deliberately much smaller than
+# `_ZIP_BUFFER_SIZE`: some NAS/FUSE mounts reject reads larger than their
+# advertised `max_read` with `OSError: [Errno 22] Invalid argument`. The source is
+# opened unbuffered so this is exactly the size handed to the OS: a buffered
+# reader would coalesce reads up to `io.DEFAULT_BUFFER_SIZE` (128 KiB on CPython
+# 3.14), which is what the previous `archive.write(...)` path effectively did.
+_ZIP_READ_SIZE = 1 << 16  # 64 KiB
+
 # Map Unicode box-drawing tree connector characters (╰──, ├──, │, …) to their
 # HTML numeric character references, so trees can be pasted directly inside a
 # <details> tag without relying on the HTML file's encoding.
@@ -179,7 +187,7 @@ class UploadProgress(Progress):
         self.overall_taskid = super().add_task(self.description, total=0)
         return self
 
-    def __exit__(self, *exc_info: Any) -> None:
+    def __exit__(self, *exc_info: object) -> None:
         super().__exit__(*exc_info)
 
     def add_task(self, *args, **kwargs) -> UpdateFn:  # type: ignore[override]
@@ -793,8 +801,14 @@ def write_zip_stream(
 
     Equivalent to `ZipFile.write` (same LZMA compression, mtime and permission
     metadata) except that `on_bytes` is invoked with the number of raw bytes
-    written after each buffer, so callers can report progress that advances even
-    within a single large file.
+    written so far, so callers can report progress that advances even within a
+    single large file.
+
+    Reads are issued in `_ZIP_READ_SIZE` blocks rather than `_ZIP_BUFFER_SIZE`
+    ones: some NAS/FUSE mounts answer reads larger than their `max_read` with
+    `OSError: [Errno 22]`. The source is opened unbuffered, so `_ZIP_READ_SIZE` is
+    exactly the size handed to the OS, and `on_bytes` is only called once per
+    `_ZIP_BUFFER_SIZE` of accumulated input to keep progress updates cheap.
 
     Note:
         `ZipInfo.from_file` defaults to `ZIP_STORED`, so the archive's compression
@@ -805,11 +819,24 @@ def write_zip_stream(
     zinfo = zipfile.ZipInfo.from_file(src, arcname)
     zinfo.compress_type = archive.compression
     zinfo._compresslevel = archive.compresslevel
-    with open(src, "rb") as fileobj, archive.open(zinfo, "w") as dest:
-        while chunk := fileobj.read(_ZIP_BUFFER_SIZE):
-            dest.write(chunk)
-            if on_bytes is not None:
-                on_bytes(len(chunk))
+    pending = 0
+    try:
+        with open(src, "rb", buffering=0) as fileobj, archive.open(zinfo, "w") as dest:
+            while chunk := fileobj.read(_ZIP_READ_SIZE):
+                dest.write(chunk)
+                if on_bytes is not None:
+                    pending += len(chunk)
+                    if pending >= _ZIP_BUFFER_SIZE:
+                        on_bytes(pending)
+                        pending = 0
+            # Report the tail, which is almost never an exact multiple of the buffer.
+            if on_bytes is not None and pending:
+                on_bytes(pending)
+    except OSError as error:
+        # Name the offending file: the traceback would otherwise only point at
+        # this function, which is useless when thousands of files are archived.
+        error.add_note(f"while archiving {src} ({_bytes_to_str(zinfo.file_size)})")
+        raise
 
 
 def _default_upload_workers(
@@ -1057,10 +1084,10 @@ def upload(
         *,
         context: Callable,
     ) -> None:
+        object_key = Path(prefix or "") / node.data.path.relative_to(
+            path.parent.resolve()
+        )
         try:
-            object_key = Path(prefix or "") / node.data.path.relative_to(
-                path.parent.resolve()
-            )
             tick(description=f"Compressing {node.data.path.name}")
 
             if not overwrite and (zip_size := exists(key=object_key)):
@@ -1074,26 +1101,32 @@ def upload(
                 zip_path = Path(tmpdir) / object_key
                 zip_path.parent.mkdir(exist_ok=True, parents=True)
 
-                with zipfile.ZipFile(
-                    zip_path, mode="w", compression=zipfile.ZIP_LZMA
-                ) as archive:
-                    if (
-                        s3.bucket is not None
-                        or s3.prefix is not None
-                        or output_dir is not None
-                    ):
-                        zip_root = node.data.path.parent.resolve()
-                        for n in node.find_all(
-                            match=lambda n: n.is_leaf(), add_self=True
+                try:
+                    with zipfile.ZipFile(
+                        zip_path, mode="w", compression=zipfile.ZIP_LZMA
+                    ) as archive:
+                        if (
+                            s3.bucket is not None
+                            or s3.prefix is not None
+                            or output_dir is not None
                         ):
-                            # Byte-smooth progress, even within a single large file.
-                            write_zip_stream(
-                                archive,
-                                n.data.path,
-                                arcname=n.data.path.relative_to(zip_root),
-                                on_bytes=lambda written: tick(advance=written),
-                            )
-                node.data.zip_size = zip_path.stat().st_size
+                            zip_root = node.data.path.parent.resolve()
+                            for n in node.find_all(
+                                match=lambda n: n.is_leaf(), add_self=True
+                            ):
+                                # Byte-smooth progress, even within a single large file.
+                                write_zip_stream(
+                                    archive,
+                                    n.data.path,
+                                    arcname=n.data.path.relative_to(zip_root),
+                                    on_bytes=lambda written: tick(advance=written),
+                                )
+                    node.data.zip_size = zip_path.stat().st_size
+                except BaseException:
+                    # Never leave a truncated archive behind: with `--output-dir`
+                    # it would outlive the run and look like a complete chunk.
+                    zip_path.unlink(missing_ok=True)
+                    raise
 
                 if uploading:
                     # Reset the bar for the upload phase: its total switches from
@@ -1108,6 +1141,11 @@ def upload(
                         object_key,
                         callback=lambda transferred: tick(advance=transferred),
                     )
+        except OSError as error:
+            # Name the archive so a worker failure is actionable straight from the
+            # log, without having to dig the key out of the tree.
+            error.add_note(f"while building archive {object_key}")
+            raise
         finally:
             # Hide the chunk bar and fold it into the overall progress bar.
             tick(visible=False)
@@ -1120,17 +1158,25 @@ def upload(
                 )
                 for _, node in zip_jobs
             ]
+            failures: list[BaseException] = []
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = [
                     executor.submit(zip_and_upload, prefix, node, tick, context=context)
                     for (prefix, node), tick in zip(zip_jobs, ticks)
                 ]
-                failures = [
-                    error
-                    for future in as_completed(futures)
-                    if (error := future.exception()) is not None
-                ]
+                for future in as_completed(futures):
+                    if (error := future.exception()) is not None:
+                        # Surface the failure immediately: a single chunk can take
+                        # minutes to hours (multi-GB LZMA archive, slow upload), so
+                        # waiting for the remaining chunks to finish would hide it.
+                        # The rest keep running, so no completed work is lost.
+                        log.error(
+                            f"Failed to archive/upload a chunk: {error}", exc_info=error
+                        )
+                        failures.append(error)
             if failures:
+                # Non-zero exit; also skips the compression-ratio summary below,
+                # which would divide by zero if every chunk of a partition failed.
                 raise failures[0]
 
     # Save all subtrees for future inspection
