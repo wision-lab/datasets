@@ -7,6 +7,7 @@ requires-python = ">=3.14"
 dependencies = [
     "boto3==1.35.31",
     "certifi",
+    "mip",
     "more-itertools",
     "natsort",
     "nutree",
@@ -37,3 +38,7 @@ target-version = "py314"
 [tool.mypy]
 python_version = "3.14"
 files = ["src"]
+
+[[tool.mypy.overrides]]
+module = ["mip", "mip.*"]
+ignore_missing_imports = true

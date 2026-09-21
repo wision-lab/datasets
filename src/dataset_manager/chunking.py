@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+import logging
 from collections.abc import Callable
 from typing import Any, Literal, Protocol
 
@@ -14,7 +15,17 @@ from .sizes import _bytes_from_str, _bytes_to_str
 from .tree import PathData
 
 # Names of the packing strategies offered by the `upload` command.
-type ChunkStrategy = Literal["legacy", "greedy"]
+type ChunkStrategy = Literal["legacy", "greedy", "optimal"]
+
+# Levels with more packable children than this are packed with the greedy
+# heuristic instead of an exact MIP: bin packing is NP-hard and a single level
+# can hold many thousands of files, where the model would be far too large.
+_MIP_MAX_ITEMS = 200
+
+# Safety net for a single MIP solve. The search already stops at the first
+# feasible bin count, so this only guards against pathological instances; on
+# timeout the greedy grouping is kept.
+_MIP_MAX_SECONDS = 30.0
 
 
 class ChunkStrategyFn(Protocol):
@@ -128,6 +139,131 @@ def _greedy_group_children(node: Node, children: list[Node], chunk_size: int) ->
     if group:
         groups.append(group)
     return groups
+
+
+def _solve_bin_packing(
+    items: list[Node],
+    chunk_size: int,
+    *,
+    lower_bound: int,
+    upper_bound: int,
+) -> list[list[Node]]:
+    """Pack `items` into the fewest bins of capacity `chunk_size` using a MIP.
+
+    Bin packing is NP-hard, so rather than minimizing the bin count directly this
+    searches for the smallest feasible number of bins starting at `lower_bound`:
+    the first feasible count is provably optimal, and each subproblem stays small
+    when only a few bins are needed. `upper_bound` (the greedy bin count) caps the
+    search.
+
+    Args:
+        items (list[Node]): Children to pack, each no larger than `chunk_size`.
+        chunk_size (int): Bin capacity (pre-compression size), in bytes.
+        lower_bound (int): Lower bound on the number of bins, ``ceil(total /
+            chunk_size)`` (at least 1 when `items` is non-empty).
+        upper_bound (int): Known feasible number of bins, from greedy packing.
+
+    Returns:
+        list[list[Node]]: One list of items per bin, in the given order.
+
+    Raises:
+        RuntimeError: If no feasible packing is found up to `upper_bound`.
+    """
+    # python-mip logs an INFO banner when it is imported; keep it off the CLI.
+    logging.getLogger("mip").setLevel(logging.WARNING)
+
+    # Imported lazily so the native solver is only loaded for `--strategy optimal`.
+    from mip import BINARY, Model, OptimizationStatus, xsum
+
+    sizes = [item.data.size or 0 for item in items]
+    n = len(items)
+
+    for bins in range(lower_bound, upper_bound + 1):
+        model = Model(solver_name="cbc")
+        model.verbose = 0
+        model.max_seconds = _MIP_MAX_SECONDS
+
+        # x[i][j] == 1 when item i is placed in bin j. Symmetry breaking: item i
+        # may only use bin j <= i (item 0 is fixed to bin 0), so interchangeable
+        # bins cannot multiply the search space.
+        x: list[list[Any]] = [
+            [model.add_var(var_type=BINARY) if j <= i else None for j in range(bins)] for i in range(n)
+        ]
+        for i in range(n):
+            model += xsum(x[i][j] for j in range(min(i, bins - 1) + 1)) == 1
+        for j in range(bins):
+            model += xsum(sizes[i] * x[i][j] for i in range(n) if x[i][j] is not None) <= chunk_size
+
+        model.optimize()
+        if model.status in (OptimizationStatus.OPTIMAL, OptimizationStatus.FEASIBLE):
+            groups: list[list[Node]] = [[] for _ in range(bins)]
+            for i, item in enumerate(items):
+                for j in range(min(i, bins - 1) + 1):
+                    if x[i][j].x >= 0.5:
+                        groups[j].append(item)
+                        break
+            return [group for group in groups if group]
+
+    raise RuntimeError(f"no feasible packing into {upper_bound} bin(s)")
+
+
+def _optimal_group_children(node: Node, children: list[Node], chunk_size: int) -> list[list[Node]]:
+    """Group a node's children into the fewest archives of at most `chunk_size`.
+
+    Solves a bin-packing MIP over the children of a single node, so files and
+    subfolders are only ever packed together with their siblings: items from
+    unrelated branches are never mixed. Falls back to `_greedy_group_children`
+    when the level is too large for the solver, when greedy already reaches the
+    optimal bin count, or when the solver fails or times out.
+
+    Args:
+        node (Node): Node whose children are being packed.
+        children (list[Node]): Eligible children, in the default packing order.
+        chunk_size (int): Target archive size (pre-compression), in bytes.
+
+    Returns:
+        list[list[Node]]: One list of children per archive, in creation order.
+    """
+    greedy = _greedy_group_children(node, children, chunk_size)
+    if len(children) <= 1:
+        return greedy
+
+    # Files are atomic, so a child larger than `chunk_size` can never share an
+    # archive; peel these off before solving, which also keeps every remaining
+    # item within capacity so the MIP is always feasible.
+    oversized = [child for child in children if (child.data.size or 0) > chunk_size]
+    packable = [child for child in children if (child.data.size or 0) <= chunk_size]
+    if not packable:
+        return greedy
+
+    packable_size = sum(child.data.size or 0 for child in packable)
+    lower_bound = max(1, -(-packable_size // chunk_size))
+
+    # Greedy already uses the fewest possible archives, so it cannot be beaten.
+    if len(greedy) <= len(oversized) + lower_bound:
+        return greedy
+
+    if len(packable) > _MIP_MAX_ITEMS:
+        log.warning(
+            f"{node.data.path} has {len(packable)} packable children, above the "
+            f"{_MIP_MAX_ITEMS}-item limit for exact packing; using greedy packing instead."
+        )
+        return greedy
+
+    try:
+        groups = _solve_bin_packing(
+            packable,
+            chunk_size,
+            lower_bound=lower_bound,
+            upper_bound=len(greedy) - len(oversized),
+        )
+    except Exception as error:  # noqa: BLE001 - any solver failure must fall back to greedy
+        log.warning(f"Optimal packing of {node.data.path} failed ({error}); using greedy packing instead.")
+        return greedy
+
+    # Oversized items come first, then the solved groups; order inside a group is
+    # the input order, so archive numbering stays deterministic.
+    return [[child] for child in oversized] + groups
 
 
 def _validate_ziptree(*, tree: Tree, original_files: set[str]) -> None:
@@ -306,9 +442,34 @@ def _greedy_split(*, tree: Tree, chunk_size: int, min_zip_depth: int) -> Tree:
     )
 
 
+def _optimal_split(*, tree: Tree, chunk_size: int, min_zip_depth: int) -> Tree:
+    """Chunk `tree` with exact per-level bin packing (`--strategy optimal`).
+
+    Every archive is at most `chunk_size`, except one holding a single file larger
+    than `chunk_size`, and each level uses the fewest archives possible; see
+    `_optimal_group_children`.
+
+    Args:
+        tree (Tree): Partition subtree, modified in place.
+        chunk_size (int): Target archive size (pre-compression), in bytes.
+        min_zip_depth (int): Depth (root = 1) at or above which a node is
+            archived even when it is smaller than `chunk_size`.
+
+    Returns:
+        Tree: `tree`, with archive nodes inserted.
+    """
+    return _split_in_place(
+        tree=tree,
+        chunk_size=chunk_size,
+        min_zip_depth=min_zip_depth,
+        group_children=_optimal_group_children,
+    )
+
+
 _CHUNK_STRATEGIES: dict[ChunkStrategy, ChunkStrategyFn] = {
     "legacy": _legacy_split,
     "greedy": _greedy_split,
+    "optimal": _optimal_split,
 }
 
 

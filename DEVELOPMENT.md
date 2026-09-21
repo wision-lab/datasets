@@ -20,7 +20,7 @@ should point at `https://web.s3.wisc.edu/` (public) or `https://campus.s3.wisc.e
 | Command | Purpose |
 | --- | --- |
 | `show-tree PATH [--full] [--s3-prefix P] [--html] [--meta]` | Print a saved tree JSON, optionally as links to public S3 objects. |
-| `upload PATH [--s3.bucket B --s3.prefix P] [--strategy legacy\|greedy] [--chunk-size N] [--partitions FILE] [--output-dir DIR] [--workers N]` | Walk a directory, partition it, split into archives, and upload (or write locally). |
+| `upload PATH [--s3.bucket B --s3.prefix P] [--strategy legacy\|greedy\|optimal] [--chunk-size N] [--partitions FILE] [--output-dir DIR] [--workers N]` | Walk a directory, partition it, split into archives, and upload (or write locally). |
 
 
 ## Tree Metadata

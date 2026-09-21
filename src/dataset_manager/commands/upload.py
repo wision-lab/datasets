@@ -145,10 +145,12 @@ def upload(
             smaller than the target.
         strategy (ChunkStrategy, optional): How a node's children are grouped into
             archives. `legacy` is the original bucket packing; `greedy` closes an
-            archive as soon as adding another child would exceed `chunk_size`.
-            Both archive exactly the same files, but with different boundaries, so
-            switching strategy changes the S3 object keys: an existing bucket has
-            to be re-uploaded (with `--overwrite`) to switch.
+            archive as soon as adding another child would exceed `chunk_size`;
+            `optimal` solves a bin-packing MIP to use the fewest archives per
+            level (falling back to `greedy` for very large levels). All archive
+            exactly the same files, but with different boundaries, so switching
+            strategy changes the S3 object keys: an existing bucket has to be
+            re-uploaded (with `--overwrite`) to switch.
         exclude (list[str], optional): Space separated list of path exclusion
             patterns. Warning something like "logs/" will match any path that
             contains logs. Internally uses `Path.match`.
