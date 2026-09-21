@@ -173,7 +173,7 @@ Tree<'test.json'>
 
 *Note:* The zip file sizes refer to the decompressed filesize, compression ratio is shown in parenthesis.
 
-*Tip:* To see the full details for each split, you can use the `show-tree` like so `uv run tools.py show-tree trees/challenges/reconstruction/test.json --full`. To generate the tree with direct download links, use `uv run tools.py show-tree trees/challenges/reconstruction/test.json --s3-prefix challenges/reconstruction`. Use `--html` to render links as HTML `<a>` tags (needed inside `<details>` tags).
+*Tip:* To see the full details for each split, you can use the `show-tree` like so `uv run dataset-manager show-tree trees/challenges/reconstruction/test.json --full`. To generate the tree with direct download links, use `uv run dataset-manager show-tree trees/challenges/reconstruction/test.json --s3-prefix challenges/reconstruction`. Use `--html` to render links as HTML `<a>` tags (needed inside `<details>` tags).
 
 </details>
 
@@ -483,7 +483,7 @@ Tree<'metadata.json'>
 
 *Note:* The zip file sizes refer to the decompressed filesize.
 
-*Tip:* To see the full details for each split, you can use the `show-tree` like so `uv run tools.py show-tree trees/visionsim50/frames.json --full`. To generate the tree with direct download links, use `uv run tools.py show-tree trees/visionsim50/frames.json --s3-prefix visionsim/visionsim50/frames`. Use `--html` to render links as HTML `<a>` tags (needed inside `<details>` tags).
+*Tip:* To see the full details for each split, you can use the `show-tree` like so `uv run dataset-manager show-tree trees/visionsim50/frames.json --full`. To generate the tree with direct download links, use `uv run dataset-manager show-tree trees/visionsim50/frames.json --s3-prefix visionsim/visionsim50/frames`. Use `--html` to render links as HTML `<a>` tags (needed inside `<details>` tags).
 
 </details>
 
@@ -513,6 +513,6 @@ Tree<'xvfi.json'>
 
 *Note:* The zip file sizes refer to the decompressed filesize.
 
-*Tip:* To see the full details for each split, you can use the `show-tree` like so `uv run tools.py show-tree trees/quanta-neural-networks/xvfi.json --full`. To generate the tree with direct download links, use `uv run tools.py show-tree trees/quanta-neural-networks/xvfi.json --s3-prefix quanta-neural-networks`. Use `--html` to render links as HTML `<a>` tags (needed inside `<details>` tags).
+*Tip:* To see the full details for each split, you can use the `show-tree` like so `uv run dataset-manager show-tree trees/quanta-neural-networks/xvfi.json --full`. To generate the tree with direct download links, use `uv run dataset-manager show-tree trees/quanta-neural-networks/xvfi.json --s3-prefix quanta-neural-networks`. Use `--html` to render links as HTML `<a>` tags (needed inside `<details>` tags).
 
 </details>
