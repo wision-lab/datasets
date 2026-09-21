@@ -24,6 +24,7 @@ from ..app import app
 from ..archives import write_zip_stream
 from ..chunking import ChunkStrategy, split_into_chunks
 from ..log import log
+from ..metadata import METADATA_KEY, collect_metadata
 from ..partitions import partition_tree_by_fnmatches
 from ..progress import UpdateFn, UploadProgress
 from ..s3 import (
@@ -373,13 +374,16 @@ def upload(
                 # which would divide by zero if every chunk of a partition failed.
                 raise failures[0]
 
-    # Save all subtrees for future inspection
+    # Save all subtrees for future inspection, tagging each with the
+    # provenance of the run that produced it (commit, command, timestamp).
     ((trees_dir or path) / "trees").mkdir(exist_ok=True, parents=True)
+    meta = {METADATA_KEY: collect_metadata()}
     for k, st in subtrees.items():
         st.save(
             (trees_dir or path) / "trees" / f"{k or 'tree'}.json",
             mapper=PathData.serialize_mapper,
             compression=True,
+            meta=meta,
         )
         size = sum(n.data.size for n in st.children)
         compressed_size = sum(n.data.zip_size or 0 for n in st)

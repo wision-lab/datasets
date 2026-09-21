@@ -7,6 +7,7 @@ from natsort import natsort_key
 from nutree import SkipBranch, Tree
 
 from ..app import app
+from ..metadata import METADATA_KEY, format_metadata
 from ..sizes import _bytes_to_str
 from ..tree import PathData
 
@@ -34,6 +35,7 @@ def show_tree(
     full: bool = False,
     s3_prefix: str | None = None,
     html: bool = False,
+    meta: bool = False,
 ) -> None:
     """Print out (zip) tree given it's path
 
@@ -46,8 +48,11 @@ def show_tree(
         html (bool, optional): If true, render links as HTML <a> tags instead of
             markdown. Useful when the output is used inside a <details> tag in
             a README where markdown links are not rendered.
+        meta (bool, optional): If true, print the tree's provenance metadata
+            (git commit, command, creation time) before the tree.
     """
-    tree: Tree = Tree.load(path, mapper=PathData.deserialize_mapper)
+    file_meta: dict = {}
+    tree: Tree = Tree.load(path, mapper=PathData.deserialize_mapper, file_meta=file_meta)
     tree.name = path.name
 
     def format_node(node) -> str:
@@ -85,6 +90,11 @@ def show_tree(
     else:
         tree.sort(key=lambda n: natsort_key(n.name), deep=True)
         output = tree.format(repr="{node.data}" if not s3_prefix else format_node)
+
+    if meta:
+        provenance = file_meta.get(METADATA_KEY)
+        header = format_metadata(provenance) if provenance else "No metadata found in this tree."
+        output = f"{header}\n\n{output}"
 
     if html:
         # HTML-escape the Unicode box-drawing tree connector characters (╰──,
