@@ -16,7 +16,7 @@ from typing import Annotated, Any, cast
 import boto3
 import questionary
 import tyro
-from nutree import SkipBranch
+from nutree import SkipBranch, Tree
 from nutree.node import Node
 from rich.status import Status
 
@@ -90,6 +90,29 @@ def _default_upload_workers(*, chunk_size: int, output_dir: Path | None, tmp_dir
             f"{_bytes_to_str(chunk_size)} archive; freeing space is recommended."
         )
     return workers
+
+
+def _confirm_zip_partition(subtrees: dict[str, Tree]) -> None:
+    """Prompt for confirmation of the partition, allowing inspection first.
+
+    The `Inspect` option prints every subtree in full, including the contents of
+    each archive that the slim preview above omits, then re-prompts so the user
+    can study the partition before committing. Aborting or interrupting the
+    prompt exits the process with status 1.
+    """
+    while True:
+        choice = questionary.select(
+            "Confirm zip partition?",
+            choices=["Confirm", "Inspect tree", "Abort"],
+            default="Confirm",
+        ).ask()
+        if choice == "Confirm":
+            return
+        if choice is None or choice == "Abort":
+            sys.exit(1)
+        for tree in subtrees.values():
+            tree.print(repr="{node.data}")
+            print()
 
 
 @app.command
@@ -216,8 +239,7 @@ def upload(
         slim_tree.print(repr="{node.data}")
         print()
 
-    if not questionary.confirm("Confirm zip partition?", default=False).ask():
-        sys.exit(1)
+    _confirm_zip_partition(subtrees)
 
     # Confirm all s3 settings, ensure we don't accidentally upload anything
     uploading = s3.bucket is not None and s3.prefix is not None
