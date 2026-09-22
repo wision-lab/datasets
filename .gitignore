@@ -6,3 +6,25 @@ __pycache__/
 .ruff_cache/
 build/
 dist/
+
+# Agent / AI assistant files (kept local, never committed)
+AGENTS.md
+agents.md
+CLAUDE.md
+claude.md
+GEMINI.md
+gemini.md
+.cursor/
+.cursorrules
+.claude/
+.opencode/
+opencode.json
+opencode.jsonc
+.github/copilot-instructions.md
+.aider*
+.continue/
+.windsurf/
+.roo/
+skills/
+*.memory.md
+memory-bank/
