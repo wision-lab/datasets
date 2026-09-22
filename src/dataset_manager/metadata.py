@@ -10,6 +10,18 @@ from typing import Any
 # they cannot collide with nutree's own `$`-prefixed header entries.
 METADATA_KEY = "dataset_manager"
 
+# The provenance fields, as ordered (key, label) pairs. Also drives the
+# `edit-tree` prompts, so a new field only has to be declared here.
+METADATA_FIELDS: tuple[tuple[str, str], ...] = (
+    ("created_utc", "Created (UTC)"),
+    ("command", "Command"),
+    ("git_commit", "Git commit"),
+    ("git_dirty", "Dirty work tree"),
+)
+
+# Fields in `METADATA_FIELDS` that hold a boolean rather than text.
+BOOLEAN_METADATA_FIELDS = frozenset({"git_dirty"})
+
 
 def _git(*args: str) -> str | None:
     """Run a git command, returning stripped stdout or None if unavailable."""
@@ -59,14 +71,8 @@ def collect_metadata() -> dict[str, Any]:
 
 def format_metadata(meta: dict[str, Any]) -> str:
     """Render metadata as plain labelled lines for display."""
-    fields = (
-        ("created_utc", "Created (UTC)"),
-        ("command", "Command"),
-        ("git_commit", "Git commit"),
-        ("git_dirty", "Dirty work tree"),
-    )
     lines: list[str] = []
-    for key, label in fields:
+    for key, label in METADATA_FIELDS:
         if key not in meta:
             continue
         value = meta[key]
