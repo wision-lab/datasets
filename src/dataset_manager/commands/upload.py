@@ -191,6 +191,10 @@ def upload(
     if workers is not None and workers < 1:
         raise ValueError("Argument `workers` must be at least 1.")
 
+    # Snapshot provenance before any work begins: an upload can run for hours, so
+    # reading the git state at the end would record a commit the run never saw.
+    meta = {METADATA_KEY: collect_metadata()}
+
     # Create filesystem tree and split it into zip-sized chunks
     def path_filter(p):
         keep = is_not_hidden(p) and is_not_dunder(p) and not is_match(p, patterns=exclude)
@@ -399,9 +403,8 @@ def upload(
                 raise failures[0]
 
     # Save all subtrees for future inspection, tagging each with the
-    # provenance of the run that produced it (commit, command, timestamp).
+    # provenance snapshotted at the start of the run.
     ((trees_dir or path) / "trees").mkdir(exist_ok=True, parents=True)
-    meta = {METADATA_KEY: collect_metadata()}
     for k, st in subtrees.items():
         st.save(
             (trees_dir or path) / "trees" / f"{k or 'tree'}.json",
