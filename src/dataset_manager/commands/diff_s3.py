@@ -168,6 +168,7 @@ def diff_s3(
     sign: bool = False,
     workers: int = 8,
     summary_only: bool = False,
+    fail_on_diff: bool = False,
     endpoint_url: str | None = None,
 ) -> None:
     """Diff the extracted file trees of two S3 prefixes.
@@ -190,6 +191,9 @@ def diff_s3(
         workers (int, optional): Number of archives whose member lists are read
             concurrently. Default 8.
         summary_only (bool, optional): Print only the counts, not the file lists.
+        fail_on_diff (bool, optional): Exit with status 1 if any file is missing
+            on either side or differs, so the command can gate a verification
+            step in a script. Default False.
         endpoint_url (str, optional): Override the S3 endpoint. Defaults to the
             `AWS_ENDPOINT_URL` variable, then to the public web endpoint
             (`https://web.s3.wisc.edu/`).
@@ -234,3 +238,6 @@ def diff_s3(
         f"{len(only_target)} only in target, {len(changed)} changed, "
         f"{nested} nested archive(s) skipped, {compressed} compressed archive(s) not expanded."
     )
+
+    if fail_on_diff and (only_source or only_target or changed):
+        raise SystemExit(1)

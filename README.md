@@ -23,13 +23,14 @@ DOWNLOAD_DIR=downloads/
 DATASET_PREFIX=quanta-vision/sequences
 
 # Clone all data from S3
-aws s3 sync s3://public-datasets/$DATASET_PREFIX $DOWNLOAD_DIR --endpoint=https://web.s3.wisc.edu --no-sign-request
+aws s3 sync "s3://public-datasets/$DATASET_PREFIX" "$DOWNLOAD_DIR" --endpoint=https://web.s3.wisc.edu --no-sign-request
 
 # Extract all zips in their CWD
-for zip in $(find $DOWNLOAD_DIR -type f -name *.zip); do 7z x $zip -o$(dirname $zip) && rm -f $zip; done
+for zip in $(find "$DOWNLOAD_DIR" -type f -name '*.zip'); do 7z x "$zip" -o"$(dirname "$zip")" && rm -f "$zip"; done
 ```
 
 *Note:* Some archives use LZMA for higher compression ratios, you can use the `7z` cli to unzip these (as above), but the `unzip` command might not work.  
+*Note:* Unpack on local disk, not on an SMB/Windows share: those filesystems reject `:` in names (e.g. `mean_frames/0:512.jpg`), which silently corrupts the extracted data.  
 *Note:* If you are on UW-Madison wifi or connected to the campus VPN, downloads will be much faster.
 
 
