@@ -17,6 +17,7 @@ from ..archives import (
     remote_archive_members,
 )
 from ..log import log
+from ..paths import sanitize_name
 from ..s3 import list_objects, make_client, resolve_prefix
 from ..sizes import _bytes_to_str
 
@@ -169,6 +170,7 @@ def diff_s3(
     workers: int = 8,
     summary_only: bool = False,
     fail_on_diff: bool = False,
+    normalize: bool = False,
     endpoint_url: str | None = None,
 ) -> None:
     """Diff the extracted file trees of two S3 prefixes.
@@ -194,6 +196,9 @@ def diff_s3(
         fail_on_diff (bool, optional): Exit with status 1 if any file is missing
             on either side or differs, so the command can gate a verification
             step in a script. Default False.
+        normalize (bool, optional): Apply `dm sanitize-paths`' Windows/SMB-safe
+            conversion to both sides before comparing, so an old prefix whose
+            names contain e.g. `:` matches its repackaged, sanitized copy.
         endpoint_url (str, optional): Override the S3 endpoint. Defaults to the
             `AWS_ENDPOINT_URL` variable, then to the public web endpoint
             (`https://web.s3.wisc.edu/`).
@@ -214,20 +219,28 @@ def diff_s3(
     print(f"Target: {target_location}  ({target_tree.objects} objects, {len(target_tree.files)} files)")
     print()
 
-    only_source = natsorted(source_tree.files.keys() - target_tree.files.keys())
-    only_target = natsorted(target_tree.files.keys() - source_tree.files.keys())
-    changed = natsorted(
-        path
-        for path in source_tree.files.keys() & target_tree.files.keys()
-        if _differs(source_tree.files[path], target_tree.files[path])
+    # `--normalize` maps both sides through the same Windows/SMB-safe conversion
+    # used by `dm sanitize-paths`, so an old prefix whose names contain e.g. `:`
+    # lines up with its sanitized copy.
+    source_files = (
+        {sanitize_name(path): fp for path, fp in source_tree.files.items()} if normalize else source_tree.files
     )
-    identical = len(source_tree.files.keys() & target_tree.files.keys()) - len(changed)
+    target_files = (
+        {sanitize_name(path): fp for path, fp in target_tree.files.items()} if normalize else target_tree.files
+    )
+
+    only_source = natsorted(source_files.keys() - target_files.keys())
+    only_target = natsorted(target_files.keys() - source_files.keys())
+    changed = natsorted(
+        path for path in source_files.keys() & target_files.keys() if _differs(source_files[path], target_files[path])
+    )
+    identical = len(source_files.keys() & target_files.keys()) - len(changed)
 
     _print_section("Only in source", list(only_source), summary_only=summary_only)
     _print_section("Only in target", list(only_target), summary_only=summary_only)
     _print_section(
         "Changed",
-        [f"{path}  [{source_tree.files[path]} -> {target_tree.files[path]}]" for path in changed],
+        [f"{path}  [{source_files[path]} -> {target_files[path]}]" for path in changed],
         summary_only=summary_only,
     )
 
