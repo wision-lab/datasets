@@ -1,11 +1,29 @@
 from __future__ import annotations
 
 import os
+import tarfile
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+import smart_open
 
 from .sizes import _bytes_to_str
+
+if TYPE_CHECKING:
+    from types_boto3_s3 import Client as S3Client
+
+# Archives whose member list can be read by seeking alone, so the payload is
+# never downloaded. Tar has no central directory, so listing it walks the
+# 512-byte headers and seeks past each member's data; that is many small ranged
+# GETs, unlike zip's single central-directory read.
+SEEKABLE_ARCHIVE_SUFFIXES = (".zip", ".tar")
+
+# Compressed tar variants are a single compressed stream: listing their members
+# would require decompressing (and therefore downloading) the whole object, so
+# they are reported and treated as opaque files instead.
+COMPRESSED_TAR_SUFFIXES = (".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".tar.zst", ".tzst")
 
 # Size of the buffers files are streamed into archives with. Also the granularity
 # at which per-chunk compression progress is reported.
@@ -67,3 +85,48 @@ def write_zip_stream(
         # this function, which is useless when thousands of files are archived.
         error.add_note(f"while archiving {src} ({_bytes_to_str(zinfo.file_size)})")
         raise
+
+
+def archive_suffix(key: str) -> str | None:
+    """Classify `key` by archive suffix.
+
+    Returns a member of `SEEKABLE_ARCHIVE_SUFFIXES` for an archive whose members
+    can be listed without downloading, a member of `COMPRESSED_TAR_SUFFIXES` for
+    an archive that cannot, or None for a plain object.
+    """
+    name = key.lower()
+    for suffix in (*SEEKABLE_ARCHIVE_SUFFIXES, *COMPRESSED_TAR_SUFFIXES):
+        if name.endswith(suffix):
+            return suffix
+    return None
+
+
+def remote_archive_members(*, s3_client: S3Client, bucket: str, key: str) -> dict[str, tuple[int, int | None]]:
+    """Read a remote archive's member list, returning member metadata.
+
+    Only archive metadata is fetched (ranged GETs through `smart_open`): zip
+    members come from the central directory, tar members from walking the headers
+    and seeking past each payload. Member data is never downloaded. Returns a
+    mapping of `member_name -> (uncompressed_size, crc32)`, where the CRC is None
+    for tar, which stores no per-member checksum. Directory entries are skipped.
+    """
+    suffix = archive_suffix(key)
+    with smart_open.open(
+        f"s3://{bucket}/{key}",
+        "rb",
+        transport_params={"client": s3_client, "defer_seek": True},
+        compression="disable",
+    ) as fileobj:
+        if suffix == ".zip":
+            with zipfile.ZipFile(fileobj) as archive:
+                return {
+                    info.filename: (info.file_size, info.CRC)
+                    for info in archive.infolist()
+                    if not info.filename.endswith("/")
+                }
+        if suffix == ".tar":
+            # "r:" forces the uncompressed, seekable reader (auto-detection would
+            # try to decompress the raw stream).
+            with tarfile.open(fileobj=fileobj, mode="r:") as archive:
+                return {info.name: (info.size, None) for info in archive if not info.isdir()}
+    raise ValueError(f"{key!r} is not a seekable archive")

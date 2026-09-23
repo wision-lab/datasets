@@ -5,7 +5,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
+import boto3
+import botocore
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
@@ -29,6 +32,80 @@ class S3Connection:
 # treats ConnectionError / HTTPClientError as transient and retries them with
 # exponential backoff, jitter and a retry quota.
 _S3_RETRY_CONFIG = Config(retries={"mode": "standard", "total_max_attempts": 10})
+
+# Public read endpoint for the `public-datasets` bucket. Used when neither
+# `--endpoint-url` nor the `AWS_ENDPOINT_URL` environment variable is set, so
+# unsigned reads of the public bucket work out of the box instead of hitting
+# AWS and getting `AccessDenied`.
+DEFAULT_ENDPOINT_URL = "https://web.s3.wisc.edu/"
+
+
+def make_client(*, sign: bool = False, endpoint_url: str | None = None) -> S3Client:
+    """Create an S3 client for read-only listing/opening.
+
+    Requests are unsigned by default, which is what public buckets need; pass
+    `sign=True` to use the standard boto3 credential chain. `endpoint_url`
+    defaults to the `AWS_ENDPOINT_URL` environment variable, and then to
+    `DEFAULT_ENDPOINT_URL`.
+    """
+    config = _S3_RETRY_CONFIG if sign else _S3_RETRY_CONFIG.merge(Config(signature_version=botocore.UNSIGNED))
+    endpoint_url = endpoint_url or os.environ.get("AWS_ENDPOINT_URL") or DEFAULT_ENDPOINT_URL
+    return boto3.client("s3", config=config, endpoint_url=endpoint_url)
+
+
+def resolve_prefix(value: str, bucket: str | None) -> tuple[str, str]:
+    """Resolve a prefix argument to a `(bucket, prefix)` pair.
+
+    `value` may be a full `s3://bucket/prefix` URI (any `s3`/`s3n`/`s3a`
+    scheme), in which case `bucket` is ignored, or a bare prefix that is then
+    combined with `bucket`.
+    """
+    parts = urlsplit(value)
+    if parts.scheme in {"s3", "s3n", "s3a"}:
+        if not parts.netloc:
+            raise ValueError(f"S3 URI without a bucket: {value!r}")
+        return parts.netloc, parts.path.lstrip("/").rstrip("/")
+    if "://" in value:
+        raise ValueError(f"Unsupported URI scheme in {value!r}; expected an s3:// URI.")
+    if bucket is None:
+        raise ValueError(f"{value!r} is a bare prefix; pass --bucket or use an s3:// URI.")
+    return bucket, value.strip("/")
+
+
+@dataclass(frozen=True)
+class S3Object:
+    """An object under a prefix, with the key needed to read it back.
+
+    `list_objects` returns these keyed by the object's path *relative* to the
+    prefix, but the full `key` is kept alongside because an S3 prefix is a plain
+    string match: a prefix like `.../pano` also matches the sibling
+    `.../pano_001.zip`, whose relative path (`_001.zip`) cannot be turned back
+    into a key by joining it onto the prefix.
+    """
+
+    key: str
+    size: int
+    etag: str
+
+
+def list_objects(*, s3_client: S3Client, bucket: str, prefix: str) -> dict[str, S3Object]:
+    """List every object under `prefix`, keyed by its path relative to `prefix`.
+
+    Directory-marker keys (those ending in `/`) are skipped, and the surrounding
+    quotes are stripped from each ETag.
+    """
+    paginator = s3_client.get_paginator("list_objects_v2")
+    objects: dict[str, S3Object] = {}
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if key.endswith("/"):
+                continue
+            relative = key[len(prefix) :].lstrip("/") if prefix else key
+            if not relative:
+                continue
+            objects[relative] = S3Object(key=key, size=obj["Size"], etag=obj.get("ETag", "").strip('"'))
+    return objects
 
 
 def check_exists(*, s3_client: S3Client, conn: S3Connection, key: str | os.PathLike) -> int:

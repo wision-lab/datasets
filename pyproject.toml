@@ -13,6 +13,7 @@ dependencies = [
     "nutree",
     "questionary",
     "rich",
+    "smart-open[s3]>=8.0.1",
     "types-boto3[s3]",
     "tyro",
 ]

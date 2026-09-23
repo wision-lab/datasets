@@ -13,7 +13,9 @@ uv run dm --help   # run the CLI (alias: dataset-manager / python -m dataset_man
 
 For uploads, credentials must exist in `~/.aws/credentials`, and `AWS_ENDPOINT_URL`
 should point at `https://web.s3.wisc.edu/` (public) or `https://campus.s3.wisc.edu/`
-(private).
+(private). `diff-s3` reads are unsigned by default and fall back to the public
+`https://web.s3.wisc.edu/` endpoint when `--endpoint-url`/`AWS_ENDPOINT_URL` are
+unset; pass `--sign` (and a private endpoint) to read private buckets.
 
 ## Commands
 
@@ -21,6 +23,7 @@ should point at `https://web.s3.wisc.edu/` (public) or `https://campus.s3.wisc.e
 | --- | --- |
 | `show-tree PATH [--full] [--s3-prefix P] [--html] [--meta]` | Print a saved tree JSON, optionally as links to public S3 objects. |
 | `upload PATH [--s3.bucket B --s3.prefix P] [--strategy legacy\|greedy\|optimal] [--chunk-size N] [--partitions FILE] [--output-dir DIR] [--workers N]` | Walk a directory, partition it, split into archives, and upload (or write locally). |
+| `diff-s3 SOURCE TARGET [--bucket B] [--sign] [--workers N] [--summary-only] [--endpoint-url URL]` | Diff the extracted file trees of two S3 prefixes. `.zip` and uncompressed `.tar` archives are expanded by reading their member lists (no download); nested archives and compressed tars are reported but not expanded. |
 
 
 ## Tree Metadata
