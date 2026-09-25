@@ -17,6 +17,9 @@ class PathData:
     is_dir: bool | None = None
     is_zip: bool = False
     has_zip_descendants: bool = False
+    # A sibling file pulled into an ancestor's archive (`merge_ratio`); its parent
+    # must not be archived separately.
+    related: bool = False
     size: int | None = None
     zip_size: int | None = None
 
@@ -40,6 +43,7 @@ class PathData:
             node.data.is_dir,
             node.data.is_zip,
             node.data.has_zip_descendants,
+            node.data.related,
             node.data.size,
             node.data.zip_size,
         )
@@ -49,16 +53,21 @@ class PathData:
     def deserialize_mapper(parent, data):
         fields = data["data"]
         # Backwards compatibility: old files may have 5 fields (missing zip_size)
+        # or 6 fields (missing `related`).
         if len(fields) == 5:
             path, is_dir, is_zip, has_zip_descendants, size = fields
-            zip_size = None
-        else:
+            related, zip_size = False, None
+        elif len(fields) == 6:
             path, is_dir, is_zip, has_zip_descendants, size, zip_size = fields
+            related = False
+        else:
+            path, is_dir, is_zip, has_zip_descendants, related, size, zip_size = fields
         return PathData(
             path=Path(path),
             is_dir=is_dir,
             is_zip=is_zip,
             has_zip_descendants=has_zip_descendants,
+            related=related,
             size=size,
             zip_size=zip_size,
         )

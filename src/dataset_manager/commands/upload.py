@@ -56,6 +56,14 @@ _ARCHIVE_LOCATION_GROUP = tyro.conf.create_mutex_group(required=False, title="ar
 _CHUNK_ATTEMPTS = 3
 _CHUNK_RETRY_BACKOFF_S = 30.0
 
+# Default for the `merge_ratio` option of `upload`: merging is off unless asked
+# for, so a run without the flag produces exactly the archive boundaries (and thus
+# S3 object keys) it produced before the option existed. A folder holding a file
+# larger than `chunk_size` is merged into that file's archive when the folder is
+# no larger than the file plus this fraction of `chunk_size`; see
+# `_merge_oversized_children` and `upload`'s `merge_ratio` docstring.
+_DEFAULT_MERGE_RATIO = 0.0
+
 
 def _default_upload_workers(*, chunk_size: int, output_dir: Path | None, tmp_dir: Path | None) -> int:
     """Pick a default number of upload workers when none is given.
@@ -132,6 +140,7 @@ def upload(
     s3: S3Connection = S3Connection(),  # noqa: B008
     chunk_size: MemSize = _bytes_from_str("10GB"),  # noqa: B008
     strategy: ChunkStrategy = "legacy",
+    merge_ratio: float = _DEFAULT_MERGE_RATIO,
     exclude: list[str] = [],  # noqa: B006
     tmp_dir: Annotated[Path | None, _ARCHIVE_LOCATION_GROUP] = None,
     output_dir: Annotated[Path | None, _ARCHIVE_LOCATION_GROUP] = None,
@@ -160,7 +169,20 @@ def upload(
             level (falling back to `greedy` for very large levels). All archive
             exactly the same files, but with different boundaries, so switching
             strategy changes the S3 object keys: an existing bucket has to be
-            re-uploaded (with `--overwrite`) to switch.
+            re-uploaded (with `--overwrite`) to switch. A file larger than
+            `chunk_size` still gets an archive of its own, but a folder holding it
+            is merged into that archive when the folder is no larger than the file
+            plus `merge_ratio * chunk_size`; folders that far exceed their biggest
+            file are packed normally. `optimal` applies the same merge, then packs
+            what is left exactly.
+        merge_ratio (float, optional): Opt-in: how much a folder may exceed its
+            largest file and still be archived with it, as a fraction of
+            `chunk_size`. Defaults to 0 (disabled), so a run without this option
+            keeps the archive boundaries of previous versions. Set it to e.g. 0.2
+            to let a folder be 20 % of `chunk_size` larger than the oversized file
+            it holds, which keeps that file's supporting files (videos, masks,
+            metadata) in the same archive; a folder larger than that — e.g. a
+            split holding many files, one of which is huge — is packed as before.
         exclude (list[str], optional): Space separated list of path exclusion
             patterns. Warning something like "logs/" will match any path that
             contains logs. Internally uses `Path.match`.
@@ -192,6 +214,9 @@ def upload(
     """
     if min_zip_depth <= 0:
         raise ValueError("Argument `min_zip_depth` must be at least 1.")
+
+    if merge_ratio < 0:
+        raise ValueError("Argument `merge_ratio` must be non-negative.")
 
     # Also enforced by the `_ARCHIVE_LOCATION_GROUP` tyro marker; kept here so
     # programmatic callers get the same guarantee.
@@ -245,6 +270,7 @@ def upload(
                 chunk_size=chunk_size,
                 min_zip_depth=partitions_dict[k].get("min_zip_depth", min_zip_depth),
                 strategy=strategy,
+                merge_ratio=merge_ratio,
             )
             for k, st in subtrees.items()
         }

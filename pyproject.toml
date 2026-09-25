@@ -30,7 +30,7 @@ build-backend = "hatchling.build"
 packages = ["src/dataset_manager"]
 
 [dependency-groups]
-dev = ["mypy", "ruff"]
+dev = ["mypy", "pytest", "ruff"]
 
 [tool.ruff]
 line-length = 121
@@ -38,7 +38,7 @@ target-version = "py314"
 
 [tool.mypy]
 python_version = "3.14"
-files = ["src"]
+files = ["src", "tests"]
 
 [[tool.mypy.overrides]]
 module = ["mip", "mip.*"]
