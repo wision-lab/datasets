@@ -6,6 +6,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import zipfile
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -46,6 +47,13 @@ from ..tree import (
 # space that is cleaned up after each archive is built, while the latter is a
 # persistent local copy of the archives. See the `upload` command.
 _ARCHIVE_LOCATION_GROUP = tyro.conf.create_mutex_group(required=False, title="archive location")
+
+# How many times a chunk is built and uploaded before its failure is reported.
+# Total cost is bounded by `_CHUNK_ATTEMPTS` times the slowest chunk, which on a
+# multi-TB dataset is hours: enough to ride out a rebooted file server, not enough
+# to hide a permanently unreadable file behind a multi-day run.
+_CHUNK_ATTEMPTS = 3
+_CHUNK_RETRY_BACKOFF_S = 30.0
 
 
 def _default_upload_workers(*, chunk_size: int, output_dir: Path | None, tmp_dir: Path | None) -> int:
@@ -377,6 +385,37 @@ def upload(
             # Hide the chunk bar and fold it into the overall progress bar.
             tick(visible=False)
 
+    # A worker failure costs the whole chunk, which for a multi-TB archive is
+    # hours of compression and upload. The failures seen in practice are a single
+    # unreadable file or a dropped connection, both of which clear on their own,
+    # so a chunk is attempted again from scratch before being reported. Archives
+    # are built into a fresh temporary directory each time, so a retry cannot pick
+    # up a partially written zip.
+    def retry_zip_and_upload(
+        prefix: str | None,
+        node: Node,
+        tick: UpdateFn,
+        *,
+        context: Callable,
+    ) -> None:
+        for attempt in range(_CHUNK_ATTEMPTS):
+            try:
+                return zip_and_upload(prefix, node, tick, context=context)
+            except OSError as error:
+                if attempt == _CHUNK_ATTEMPTS - 1:
+                    raise
+                tick(
+                    description=f"Retrying {node.data.path.name}",
+                    total=node.data.size or 0,
+                    completed=0,
+                )
+                log.warning(
+                    f"{node.data.path.name} failed ({error}); "
+                    f"retrying ({attempt + 2}/{_CHUNK_ATTEMPTS})."
+                )
+                time.sleep(_CHUNK_RETRY_BACKOFF_S * 2**attempt)
+        raise AssertionError("unreachable")
+
     if zip_jobs:
         with UploadProgress() as progress:
             ticks = [
@@ -386,7 +425,7 @@ def upload(
             failures: list[BaseException] = []
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = [
-                    executor.submit(zip_and_upload, prefix, node, tick, context=context)
+                    executor.submit(retry_zip_and_upload, prefix, node, tick, context=context)
                     for (prefix, node), tick in zip(zip_jobs, ticks)
                 ]
                 for future in as_completed(futures):

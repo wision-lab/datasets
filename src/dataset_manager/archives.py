@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import errno
 import os
 import tarfile
+import time
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import smart_open
 
+from .log import log
 from .sizes import _bytes_to_str
 
 if TYPE_CHECKING:
@@ -29,13 +32,48 @@ COMPRESSED_TAR_SUFFIXES = (".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".
 # at which per-chunk compression progress is reported.
 _ZIP_BUFFER_SIZE = 1 << 20  # 1 MiB
 
-# Size of each individual read from the source. Deliberately much smaller than
+# Size of each individual read from the source. Deliberately smaller than
 # `_ZIP_BUFFER_SIZE`: some NAS/FUSE mounts reject reads larger than their
 # advertised `max_read` with `OSError: [Errno 22] Invalid argument`. The source is
 # opened unbuffered so this is exactly the size handed to the OS: a buffered
 # reader would coalesce reads up to `io.DEFAULT_BUFFER_SIZE` (128 KiB on CPython
 # 3.14), which is what the previous `archive.write(...)` path effectively did.
 _ZIP_READ_SIZE = 1 << 16  # 64 KiB
+
+# Lower bound for the adaptive read size below. FUSE's own `max_read` defaults to
+# this and no real mount advertises less, so a source that still answers `EINVAL`
+# at this size is failing for some other reason and the error is raised.
+_ZIP_MIN_READ_SIZE = 1 << 13  # 8 KiB
+
+# Errors that mean "this read did not happen, but the file is fine": a connection
+# drop or a server-side reboot makes the gvfs/NetworkManager FUSE layer surface
+# `EIO`/`ESTALE` on a read of an otherwise healthy file. Anything else (`EINVAL`
+# on a small read, `ENOENT`, `EACCES`, ...) is a real failure and propagates.
+_TRANSIENT_READ_ERRNOS = frozenset({errno.EIO, errno.ESTALE})
+
+# Per-read retry budget. The failures these cover last seconds at most (a
+# reconnect), and a multi-TB archive issues millions of reads, so the budget is
+# deliberately small: retries delay the error surfaced for a genuinely dead
+# source far less than they extend the run when a mount flaps repeatedly.
+_ZIP_READ_RETRIES = 4
+_ZIP_READ_BACKOFF_S = 0.5
+
+
+def _read_block(fileobj: Any, size: int) -> bytes:
+    """Read up to `size` bytes, retrying the transient failures of a FUSE mount.
+
+    Raises the original `OSError` once the retry budget for that single read is
+    exhausted, so a dead mount still fails the chunk instead of stalling it.
+    """
+    for attempt in range(_ZIP_READ_RETRIES + 1):
+        try:
+            return fileobj.read(size)
+        except OSError as error:
+            if error.errno not in _TRANSIENT_READ_ERRNOS or attempt == _ZIP_READ_RETRIES:
+                raise
+            log.debug(f"Retrying read of {size} bytes after {error}")
+            time.sleep(_ZIP_READ_BACKOFF_S * 2**attempt)
+    raise AssertionError("unreachable")
 
 
 def write_zip_stream(
@@ -52,11 +90,17 @@ def write_zip_stream(
     written so far, so callers can report progress that advances even within a
     single large file.
 
-    Reads are issued in `_ZIP_READ_SIZE` blocks rather than `_ZIP_BUFFER_SIZE`
-    ones: some NAS/FUSE mounts answer reads larger than their `max_read` with
-    `OSError: [Errno 22]`. The source is opened unbuffered, so `_ZIP_READ_SIZE` is
-    exactly the size handed to the OS, and `on_bytes` is only called once per
-    `_ZIP_BUFFER_SIZE` of accumulated input to keep progress updates cheap.
+    Reads start at `_ZIP_READ_SIZE` and are halved (down to `_ZIP_MIN_READ_SIZE`)
+    whenever the source rejects one with `OSError: [Errno 22]`, which is how some
+    NAS/FUSE mounts answer reads larger than the `max_read` they advertise. The
+    reduced size is kept for the whole archive: mounts that reject a size do so
+    consistently, so every later read would otherwise pay the same round trip to
+    rediscover it. Transient errors (`EIO`/`ESTALE`, i.e. a FUSE mount whose
+    connection blipped) are retried a few times before giving up. The source is
+    opened unbuffered so the size handed to `read` is exactly the size handed to
+    the OS: a buffered reader would coalesce reads up to `io.DEFAULT_BUFFER_SIZE`
+    (128 KiB on CPython 3.14), which is what the previous `archive.write(...)`
+    path effectively did.
 
     Note:
         `ZipInfo.from_file` defaults to `ZIP_STORED`, so the archive's compression
@@ -70,7 +114,7 @@ def write_zip_stream(
     pending = 0
     try:
         with open(src, "rb", buffering=0) as fileobj, archive.open(zinfo, "w") as dest:
-            while chunk := fileobj.read(_ZIP_READ_SIZE):
+            for chunk in _read_blocks(fileobj, src=src):
                 dest.write(chunk)
                 if on_bytes is not None:
                     pending += len(chunk)
@@ -85,6 +129,32 @@ def write_zip_stream(
         # this function, which is useless when thousands of files are archived.
         error.add_note(f"while archiving {src} ({_bytes_to_str(zinfo.file_size)})")
         raise
+
+
+def _read_blocks(fileobj: Any, *, src: Path) -> Iterator[bytes]:
+    """Yield `src`'s contents in blocks, shrinking the block size when required.
+
+    `EINVAL` on a read means the FUSE mount refused a request of that size, not
+    that the file is unreadable: halving the request until the mount accepts it
+    keeps such a source archivable instead of failing the whole chunk. Any other
+    error is either retried (transient) or raised, via `_read_block`.
+    """
+    size = _ZIP_READ_SIZE
+    while True:
+        try:
+            chunk = _read_block(fileobj, size)
+        except OSError as error:
+            if error.errno != errno.EINVAL or size <= _ZIP_MIN_READ_SIZE:
+                raise
+            size //= 2
+            log.warning(
+                f"{src} rejected a {_bytes_to_str(size * 2)} read ({error}); "
+                f"retrying with {_bytes_to_str(size)} blocks."
+            )
+            continue
+        if not chunk:
+            return
+        yield chunk
 
 
 def archive_suffix(key: str) -> str | None:
