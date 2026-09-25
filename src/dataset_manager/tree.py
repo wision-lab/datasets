@@ -8,6 +8,7 @@ from pathlib import Path
 from nutree import Tree
 from nutree.node import Node
 
+from .log import log
 from .sizes import _bytes_to_str
 
 
@@ -101,12 +102,38 @@ def populate_filesize(*, node: Node | Tree, refresh: bool = False) -> Node | Tre
     return node
 
 
+def drop_empty_dirs(*, node: Node) -> int:
+    """Remove descendant directories that hold no files, deepest first.
+
+    An empty directory is a leaf of the walked tree, so `upload` would write it into
+    an archive and `write_zip_stream` would then try to open it as a file
+    (`IsADirectoryError`). Nothing could ever match it on the other side either: S3
+    stores no directory entries. The passed node itself is always kept, so a tree
+    whose root holds no files stays representable. Returns the number of nodes
+    removed.
+    """
+    removed = 0
+    for child in list(node.children):
+        if not child.data.is_dir:
+            continue
+        removed += drop_empty_dirs(node=child)
+        if not child.children:
+            child.remove()
+            removed += 1
+    return removed
+
+
 def directory_tree(
     path: str | os.PathLike,
     on_error: Callable | None = None,
     follow_symlinks: bool = False,
     filter_fn: Callable | None = None,
 ) -> Tree:
+    """Build the tree of a directory listing.
+
+    Directories with no file below them are dropped (see `drop_empty_dirs`), because
+    `upload` archives files only.
+    """
     path = Path(path).resolve()
     tree: Tree = Tree("Directory Listing")
     root = tree.add(PathData(path=path))
@@ -144,6 +171,9 @@ def directory_tree(
                 )
                 child = parent.add(child_data)
                 path2node[str(child.data.path.resolve())] = child
+    removed = drop_empty_dirs(node=root)
+    if removed:
+        log.info(f"Ignoring empty directories under {path} ({removed} removed).")
     populate_filesize(node=root)
     return tree
 

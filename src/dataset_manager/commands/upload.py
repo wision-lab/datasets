@@ -250,6 +250,9 @@ def upload(
             follow_symlinks=follow_symlinks,
         )
 
+    if not any(not node.data.is_dir for node in file_tree):
+        raise ValueError(f"{path} contains no files; nothing to upload.")
+
     with Status("Partitioning Tree...", spinner="bouncingBall"):
         if partitions:
             with open(partitions, "r") as f:

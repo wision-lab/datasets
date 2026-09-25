@@ -262,6 +262,10 @@ def _collect_local_files(*, path: Path, workers: int) -> VirtualTree:
     member lists from the filesystem (nothing is decompressed), compressed tars are
     reported and kept as opaque files, and every other file is a loose file. S3 has no
     directory entries, so directories are not part of the comparison.
+
+    A folder with no file below it therefore contributes no key, which is the local
+    counterpart of `tree.drop_empty_dirs`: `upload` never writes a directory into an
+    archive, so a mixed local-vs-S3 diff can never report one as one-sided.
     """
     path = path.resolve()
     entries: dict[str, Path] = {}

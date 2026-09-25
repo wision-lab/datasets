@@ -217,3 +217,22 @@ def test_a_compressed_tar_is_reported_and_kept_as_a_loose_file(tmp_path: Path) -
     (root / "part.tar.gz").write_bytes(b"\x1f\x8b not really gzip")
     files = collect(root)
     assert files["part.tar.gz"].kind == "file"
+
+
+def test_empty_directories_never_enter_the_comparison(tmp_path: Path) -> None:
+    """S3 has no directory entries, so an empty folder must not become a one-sided key.
+
+    `upload` drops them before chunking (see `tree.drop_empty_dirs`), so a local copy
+    that still has them must compare identical to the archive side.
+    """
+    root = tmp_path / "src"
+    extracted = tmp_path / "extracted"
+    write_local_tree(root)
+    extract_local_tree(root, extracted)
+    (extracted / "a" / "x" / "empty").mkdir()
+    (extracted / "only" / "empty").mkdir(parents=True)
+
+    source = collect(root)
+    target = collect(extracted)
+    assert sorted(source) == sorted(target) == ["a/x/1.jpg", "a/x/2.jpg", "b/y.txt"]
+    assert not [path for path in source if _differs(source[path], target[path])]
