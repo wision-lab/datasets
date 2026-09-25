@@ -26,6 +26,7 @@ from ..archives import write_zip_stream
 from ..chunking import ChunkStrategy, split_into_chunks
 from ..log import log
 from ..metadata import METADATA_KEY, collect_metadata
+from ..pager import show
 from ..partitions import partition_tree_by_fnmatches
 from ..progress import UpdateFn, UploadProgress
 from ..s3 import (
@@ -105,8 +106,10 @@ def _confirm_zip_partition(subtrees: dict[str, Tree]) -> None:
 
     The `Inspect` option prints every subtree in full, including the contents of
     each archive that the slim preview above omits, then re-prompts so the user
-    can study the partition before committing. Aborting or interrupting the
-    prompt exits the process with status 1.
+    can study the partition before committing. Paging is applied through the same
+    helper as `show-tree`, so the output is scrollable in a terminal and printed
+    verbatim when stdout is redirected. Aborting or interrupting the prompt exits
+    the process with status 1.
     """
     while True:
         choice = questionary.select(
@@ -119,8 +122,7 @@ def _confirm_zip_partition(subtrees: dict[str, Tree]) -> None:
         if choice is None or choice == "Abort":
             sys.exit(1)
         for tree in subtrees.values():
-            tree.print(repr="{node.data}")
-            print()
+            show(tree.format(repr="{node.data}"))
 
 
 @app.command
@@ -409,10 +411,7 @@ def upload(
                     total=node.data.size or 0,
                     completed=0,
                 )
-                log.warning(
-                    f"{node.data.path.name} failed ({error}); "
-                    f"retrying ({attempt + 2}/{_CHUNK_ATTEMPTS})."
-                )
+                log.warning(f"{node.data.path.name} failed ({error}); retrying ({attempt + 2}/{_CHUNK_ATTEMPTS}).")
                 time.sleep(_CHUNK_RETRY_BACKOFF_S * 2**attempt)
         raise AssertionError("unreachable")
 

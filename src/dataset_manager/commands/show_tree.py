@@ -8,6 +8,7 @@ from nutree import SkipBranch, Tree
 
 from ..app import app
 from ..metadata import METADATA_KEY, format_metadata
+from ..pager import show
 from ..sizes import _bytes_to_str
 from ..tree import PathData
 
@@ -36,6 +37,7 @@ def show_tree(
     s3_prefix: str | None = None,
     html: bool = False,
     meta: bool = False,
+    pager: bool = True,
 ) -> None:
     """Print out (zip) tree given it's path
 
@@ -50,6 +52,10 @@ def show_tree(
             a README where markdown links are not rendered.
         meta (bool, optional): If true, print the tree's provenance metadata
             (git commit, command, creation time) before the tree.
+        pager (bool, optional): If true (the default), scroll the tree in a pager
+            (`$PAGER`, falling back to `less`) when stdout is a terminal. Pass
+            `--no-pager` to print it directly. Output that is not a terminal, and
+            `--html` output, is never paged.
     """
     file_meta: dict = {}
     tree: Tree = Tree.load(path, mapper=PathData.deserialize_mapper, file_meta=file_meta)
@@ -106,4 +112,9 @@ def show_tree(
         # inside a <details> tag, markdown code blocks are not rendered.
         output = f"<pre>\n{output}\n</pre>"
 
-    print(output)
+    # HTML is meant to be pasted into a README rather than read in a terminal, so
+    # it is never paged even when stdout happens to be a TTY.
+    if pager and not html:
+        show(output)
+    else:
+        print(output)

@@ -148,8 +148,7 @@ def _read_blocks(fileobj: Any, *, src: Path) -> Iterator[bytes]:
                 raise
             size //= 2
             log.warning(
-                f"{src} rejected a {_bytes_to_str(size * 2)} read ({error}); "
-                f"retrying with {_bytes_to_str(size)} blocks."
+                f"{src} rejected a {_bytes_to_str(size * 2)} read ({error}); retrying with {_bytes_to_str(size)} blocks."
             )
             continue
         if not chunk:
