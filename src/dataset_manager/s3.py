@@ -40,15 +40,30 @@ _S3_RETRY_CONFIG = Config(retries={"mode": "standard", "total_max_attempts": 10}
 DEFAULT_ENDPOINT_URL = "https://web.s3.wisc.edu/"
 
 
-def make_client(*, sign: bool = False, endpoint_url: str | None = None) -> S3Client:
+def _pool_config(workers: int) -> Config:
+    """Size the HTTP connection pool to the caller's concurrency.
+
+    botocore defaults `max_pool_connections` to 10, so any thread pool larger
+    than that -- and tar listing, which issues one ranged GET per member -- makes
+    urllib3 discard and re-establish connections, logging "Connection pool is
+    full" and paying a fresh TLS handshake each time. `workers` is the number of
+    concurrent readers; the pool gets headroom for their in-flight requests.
+    """
+    return Config(max_pool_connections=max(10, workers * 2))
+
+
+def make_client(*, sign: bool = False, endpoint_url: str | None = None, workers: int = 8) -> S3Client:
     """Create an S3 client for read-only listing/opening.
 
     Requests are unsigned by default, which is what public buckets need; pass
     `sign=True` to use the standard boto3 credential chain. `endpoint_url`
     defaults to the `AWS_ENDPOINT_URL` environment variable, and then to
-    `DEFAULT_ENDPOINT_URL`.
+    `DEFAULT_ENDPOINT_URL`. `workers` sizes the connection pool to the caller's
+    thread pool so concurrent reads do not thrash it.
     """
-    config = _S3_RETRY_CONFIG if sign else _S3_RETRY_CONFIG.merge(Config(signature_version=botocore.UNSIGNED))
+    config = _S3_RETRY_CONFIG.merge(_pool_config(workers))
+    if not sign:
+        config = config.merge(Config(signature_version=botocore.UNSIGNED))
     endpoint_url = endpoint_url or os.environ.get("AWS_ENDPOINT_URL") or DEFAULT_ENDPOINT_URL
     return boto3.client("s3", config=config, endpoint_url=endpoint_url)
 

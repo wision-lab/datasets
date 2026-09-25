@@ -421,7 +421,7 @@ def diff_s3(
     source_root = _resolve_operand(source, bucket)
     target_root = _resolve_operand(target, bucket)
 
-    s3_client = make_client(sign=sign, endpoint_url=endpoint_url)
+    s3_client = make_client(sign=sign, endpoint_url=endpoint_url, workers=workers)
 
     with Status("Building virtual trees...", spinner="bouncingBall"):
         if isinstance(source_root, LocalRoot):
