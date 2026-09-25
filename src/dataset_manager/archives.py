@@ -28,6 +28,11 @@ SEEKABLE_ARCHIVE_SUFFIXES = (".zip", ".tar")
 # they are reported and treated as opaque files instead.
 COMPRESSED_TAR_SUFFIXES = (".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".tar.zst", ".tzst")
 
+# Every archive suffix `archive_suffix` classifies: the seekable ones, whose member
+# lists can be read by seeking, plus the compressed tars, which cannot be listed
+# without decompressing the whole stream.
+ARCHIVE_SUFFIXES = (*SEEKABLE_ARCHIVE_SUFFIXES, *COMPRESSED_TAR_SUFFIXES)
+
 # Size of the buffers files are streamed into archives with. Also the granularity
 # at which per-chunk compression progress is reported.
 _ZIP_BUFFER_SIZE = 1 << 20  # 1 MiB
@@ -164,7 +169,7 @@ def archive_suffix(key: str) -> str | None:
     an archive that cannot, or None for a plain object.
     """
     name = key.lower()
-    for suffix in (*SEEKABLE_ARCHIVE_SUFFIXES, *COMPRESSED_TAR_SUFFIXES):
+    for suffix in ARCHIVE_SUFFIXES:
         if name.endswith(suffix):
             return suffix
     return None
