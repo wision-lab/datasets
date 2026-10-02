@@ -24,6 +24,7 @@ unset; pass `--sign` (and a private endpoint) to read private buckets.
 | `show-tree PATH [--full] [--s3-prefix P] [--html] [--meta]` | Print a saved tree JSON, optionally as links to public S3 objects. |
 | `upload PATH [--s3.bucket B --s3.prefix P] [--strategy legacy\|greedy\|optimal] [--merge-ratio R] [--chunk-size N] [--partitions FILE] [--output-dir DIR] [--workers N]` | Walk a directory, partition it, split into archives, and upload (or write locally). |
 | `diff-s3 SOURCE TARGET [--bucket B] [--sign] [--workers N] [--summary-only] [--endpoint-url URL]` | Diff the extracted file trees of two S3 prefixes. `.zip` and uncompressed `.tar` archives are expanded by reading their member lists (no download); nested archives and compressed tars are reported but not expanded. Either operand may instead be an existing local directory: its archives are expanded in place from the filesystem, and loose files are compared by size + MD5. |
+| `check-gz PATH [--name NAME] [--compress] [--no-keep] [--dry-run] [--no-check] [--workers N]` | Verify that each `<name>` file has a byte-identical `<name>.gz` sibling; `--compress` first gzips files without one (then hashes the result to prove the write), and `--no-keep` deletes a source file only after a proven match, re-checked immediately before unlinking. Works for any `--name`, not just `.npy`; `--workers N` starts exactly `N` threads, one file per task. |
 
 
 ## Chunking

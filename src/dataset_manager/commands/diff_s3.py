@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import os
 import posixpath
 import re
@@ -22,6 +21,7 @@ from ..archives import (
     archive_suffix,
     remote_archive_members,
 )
+from ..hashing import md5_stream
 from ..log import log
 from ..paths import sanitize_name
 from ..s3 import list_objects, make_client, resolve_prefix
@@ -39,9 +39,6 @@ _MD5_ETAG_RE = re.compile(r"^[0-9a-f]{32}$")
 # Local files that `upload` never archives, so the S3 side cannot have them: excluded
 # from the local walk rather than reported as one-sided noise.
 _IGNORED_LOCAL_NAMES = frozenset({".DS_Store", "Thumbs.db"})
-
-# Size of the blocks a local file is hashed in, so a multi-GB file never lands in memory.
-_HASH_BLOCK_SIZE = 1 << 20  # 1 MiB
 
 
 @dataclass(frozen=True)
@@ -246,13 +243,9 @@ def _local_file_fingerprint(path: Path) -> Fingerprint | None:
     """
     if path.name in _IGNORED_LOCAL_NAMES:
         return None
-    size = 0
-    hasher = hashlib.md5()
-    with open(path, "rb", buffering=0) as fileobj, memoryview(bytearray(_HASH_BLOCK_SIZE)) as buffer:
-        while chunk := fileobj.readinto(buffer):
-            hasher.update(buffer[:chunk])
-            size += chunk
-    return Fingerprint(kind="file", size=size, checksum=hasher.hexdigest())
+    with open(path, "rb", buffering=0) as fileobj:
+        checksum, size = md5_stream(fileobj)
+    return Fingerprint(kind="file", size=size, checksum=checksum)
 
 
 def _collect_local_files(*, path: Path, workers: int) -> VirtualTree:
