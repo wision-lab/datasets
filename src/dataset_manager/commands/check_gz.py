@@ -430,7 +430,7 @@ def _run_pool(
         rows: dict[int, UpdateFn] = {}
 
         def submit(task: FileTask) -> Future[FileTask]:
-            tick = progress.add_task(f"{task.role} {task.path.name}", total=0)
+            tick = progress.add_task(f"Hashing {task.path}", total=0)
             rows[id(task)] = tick
             task.task_id = tick
             return pool.submit(hash_file, task, on_bytes=lambda chunk: tick(advance=chunk))
@@ -500,7 +500,7 @@ def _compress_one(
     quiet: bool,
 ) -> bool:
     """Compress one sibling-less source, showing its own bar. True when it worked."""
-    tick = progress.add_task(f"compress {task.path.name}", total=task.size)
+    tick = progress.add_task(f"Compressing {task.path}", total=task.size)
     try:
         result = compress(task.path, level=level, force=force, on_bytes=lambda chunk: tick(advance=chunk))
     finally:
