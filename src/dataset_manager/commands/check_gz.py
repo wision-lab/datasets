@@ -60,13 +60,16 @@ class FileTask:
     A pair contributes two of these (source, compressed); a file with no sibling
     contributes one, plus a later compression job. `pair` links the two tasks of
     a pair so the join can find each other, and `cancel` is the shared abort flag
-    both of them poll.
+    both of them poll. `expected` is the raw on-disk size, measured at construction
+    so the bar has a total before hashing starts; `size` is what hashing actually
+    read, which the comparison uses and which differs from `expected` for a `gz`.
     """
 
     path: Path
     role: Role
-    pair: int  # index into the pair table
+    pair: int
     cancel: Event
+    expected: int = 0
     digest: str = ""
     size: int = 0
     error: str = ""
@@ -120,34 +123,59 @@ class Compressed:
         return not self.error
 
 
-def _open(path: Path) -> IO[bytes]:
-    """Open a plain file or a gzip stream.
+def _open(path: Path) -> tuple[IO[bytes], IO[bytes] | None]:
+    """Open a plain file or a gzip stream; also return the underlying raw file.
 
     `GzipFile` re-blocks reads internally and wraps the raw file in its own
     `BufferedReader`, so neither the buffer size passed here nor the size of a
     read on the decompressed side changes how many syscalls reach the filesystem:
     measured at ~101k raw reads for an 11 GiB member at chunk sizes from 64 KiB to
     64 MiB. There is no read-size tuning knob here worth having.
+
+    The second element is the raw file under a `GzipFile`, whose offset measures
+    the compressed bytes consumed, so a `gz` row can report "bytes read / bytes in
+    the file" against the stored size. It is None for a plain file, where the
+    stream's own offset already is that number.
     """
     if path.suffix == GZIP_SUFFIX:
-        return cast("IO[bytes]", gzip.open(path, "rb"))
-    return path.open("rb", buffering=0)
+        raw = path.open("rb")
+        return cast("IO[bytes]", gzip.GzipFile(fileobj=raw)), raw
+    return path.open("rb", buffering=0), None
 
 
-def hash_file(task: FileTask, *, on_bytes: Callable[[int], None] | None = None) -> FileTask:
+def hash_file(
+    task: FileTask,
+    *,
+    on_progress: Callable[[int], None] | None = None,
+) -> FileTask:
     """Hash one file, honouring its pair's cancel flag. Runs in a worker thread.
 
     Returns the task with `digest`/`size` filled, or `error` set. `HashCancelled`
     is recorded as an error with a fixed message so the pair join can tell "the
     peer failed" apart from "this file is wrong".
+
+    `on_progress` receives the bytes read from the file on disk (compressed bytes
+    for a `.gz`), which is the only reading that closes against the file's size.
     """
+    fileobj: IO[bytes] | None = None
+    raw: IO[bytes] | None = None
     try:
-        with _open(task.path) as fileobj:
-            task.digest, task.size = md5_stream(fileobj, cancelled=task.cancel.is_set, on_bytes=on_bytes)
+        fileobj, raw = _open(task.path)
+        with fileobj:
+            task.digest, task.size = md5_stream(
+                fileobj,
+                cancelled=task.cancel.is_set,
+                on_progress=on_progress,
+                source=raw,
+            )
     except HashCancelled:
         task.error = "stopped early: the other file of the pair failed"
     except (OSError, EOFError, gzip.BadGzipFile) as exc:
         task.error = f"{type(exc).__name__}: {exc}"
+    finally:
+        # A `GzipFile` does not close the file it was handed, so close it here.
+        if raw is not None and not raw.closed:
+            raw.close()
     return task
 
 
@@ -349,6 +377,7 @@ def _describe(result: Result) -> tuple[str, str]:
 def _run_pool(
     entries: list[Entry],
     *,
+    root: Path,
     workers: int,
     level: int,
     force: bool,
@@ -359,6 +388,9 @@ def _run_pool(
     quiet: bool,
 ) -> int:  # exit code contribution: 1 on any bad outcome, else 0
     """Submit every file-hash task, join pairs as they complete, and act on each.
+
+    `root` is only used to shorten progress descriptions to the path relative to the
+    scanned directory, which is what makes a row readable without being unique.
 
     One `FileTask` per file (`--compress` adds a compression task plus a verifying
     hash task for files with no sibling). The pool is exactly `workers` threads;
@@ -371,6 +403,10 @@ def _run_pool(
     """
     console = Console(stderr=True)
 
+    def short(path: Path) -> str:
+        """Path relative to `root`: unique within the run, without the prefix noise."""
+        return str(path.relative_to(root))
+
     pairs: list[PairState] = []
     tasks: list[FileTask] = []
     # Scanned pairs are the first `scanned` entries; the compression/verify chain
@@ -382,13 +418,13 @@ def _run_pool(
         cancel = Event()
         if entry.gz is not None:
             state = PairState(
-                source=FileTask(entry.source, "source", index, cancel),
-                gz=FileTask(entry.gz, "gz", index, cancel),
+                source=FileTask(entry.source, "source", index, cancel, expected=entry.size),
+                gz=FileTask(entry.gz, "gz", index, cancel, expected=_safe_size(entry.gz)),
             )
             tasks.extend((state.source, state.gz))
         else:
             state = PairState(
-                source=FileTask(entry.source, "source", index, cancel),
+                source=FileTask(entry.source, "source", index, cancel, expected=entry.size),
                 gz=FileTask(compressed_path(entry.source), "gz", index, cancel),
             )
             spare.add(index)
@@ -430,10 +466,13 @@ def _run_pool(
         rows: dict[int, UpdateFn] = {}
 
         def submit(task: FileTask) -> Future[FileTask]:
-            tick = progress.add_task(f"Hashing {task.path}", total=0)
+            # The total is the raw on-disk size measured at scan time, so the bar
+            # advances from the first block; `advance` reports decompressed bytes
+            # for a `.gz`, which is why the total is its compressed size.
+            tick = progress.add_task(f"Hashing {short(task.path)}", total=task.expected)
             rows[id(task)] = tick
             task.task_id = tick
-            return pool.submit(hash_file, task, on_bytes=lambda chunk: tick(advance=chunk))
+            return pool.submit(hash_file, task, on_progress=lambda pos: tick(completed=pos))
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
             pending: dict[Future[FileTask], FileTask] = {submit(task): task for task in tasks}
@@ -444,7 +483,9 @@ def _run_pool(
                     task = pending.pop(future)
                     future.result()  # hash_file records failures on the task; nothing raises
                     tick = rows.pop(id(task))
-                    tick(completed=task.size if not task.error else 0, visible=False)
+                    # Retire the row as-is: progress already reached the file's
+                    # size via `on_progress`, so nothing needs to be invented here.
+                    tick(visible=False)
                     state = pairs[task.pair]
 
                     if task.error and not task.error.startswith("stopped early"):
@@ -465,7 +506,15 @@ def _run_pool(
                         if task.error:
                             continue
                         if compress:
-                            if not _compress_one(console, progress, task, level=level, force=force, quiet=quiet):
+                            if not _compress_one(
+                                console,
+                                progress,
+                                task,
+                                label=short(task.path),
+                                level=level,
+                                force=force,
+                                quiet=quiet,
+                            ):
                                 bad = True
                                 continue
                             if not check:
@@ -473,7 +522,13 @@ def _run_pool(
                             # Verify the write: hash the new `.gz` against the
                             # source digest already in hand, exactly like a
                             # scanned pair.
-                            gz_task = FileTask(compressed_path(task.path), "gz", task.pair, Event())
+                            gz_task = FileTask(
+                                compressed_path(task.path),
+                                "gz",
+                                task.pair,
+                                Event(),
+                                expected=_safe_size(compressed_path(task.path)),
+                            )
                             state.gz = gz_task
                             pending[submit(gz_task)] = gz_task
                         continue
@@ -495,16 +550,21 @@ def _compress_one(
     progress: UploadProgress,
     task: FileTask,
     *,
+    label: str,
     level: int,
     force: bool,
     quiet: bool,
 ) -> bool:
-    """Compress one sibling-less source, showing its own bar. True when it worked."""
-    tick = progress.add_task(f"Compressing {task.path}", total=task.size)
+    """Compress one sibling-less source, showing its own bar. True when it worked.
+
+    `label` is the source path relative to the scan root, used for the bar so it
+    matches the `Hashing` rows.
+    """
+    tick = progress.add_task(f"Compressing {label}", total=task.expected)
     try:
         result = compress(task.path, level=level, force=force, on_bytes=lambda chunk: tick(advance=chunk))
     finally:
-        tick(completed=task.size, visible=False)
+        tick(completed=task.expected, visible=False)
     if not result.ok:
         if not quiet:
             console.print(f"skipped {result.source}: {result.error}", style="yellow", highlight=False)
@@ -590,6 +650,7 @@ def check_gz(
 
     rc = _run_pool(
         entries,
+        root=directory,
         workers=workers,
         level=level,
         force=force,
