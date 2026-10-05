@@ -26,8 +26,6 @@ from dataset_manager.commands.check_gz import (
     Compressed,
     FileTask,
     PairState,
-    Result,
-    _compare_paths,
     _run_pool,
     check_gz,
     compress,
@@ -49,6 +47,17 @@ def write_pair(directory: Path, data: bytes = b"payload", *, name: str = "binary
     with gzip.open(gz, "wb") as handle:
         handle.write(data)
     return source, gz
+
+
+def _hashed(source: Path, gz: Path) -> PairState:
+    """A `PairState` whose two files are already hashed, as the pool would leave it."""
+    state = PairState(
+        source=FileTask(source, "source", 0, Event()),
+        gz=FileTask(gz, "gz", 0, Event()),
+    )
+    hash_file(state.source)
+    hash_file(state.gz)
+    return state
 
 
 # --- hashing and comparison ---------------------------------------------------
@@ -173,16 +182,17 @@ def test_md5_stream_position_falls_back_to_zero(tmp_path: Path) -> None:
     assert seen and set(seen) == {0}
 
 
-def test_compare_reports_match_and_mismatch(tmp_path: Path) -> None:
+def test_resolve_pair_reports_match_and_mismatch(tmp_path: Path) -> None:
+    """`resolve_pair` on two hashed tasks is the comparison, with no path helper in between."""
     source, gz = write_pair(tmp_path / "good", b"same")
-    assert _compare_paths(source, gz).status is MATCH
+    assert resolve_pair(_hashed(source, gz)).status is MATCH
 
     bad = tmp_path / "bad"
     bad.mkdir()
     (bad / "binary.npy").write_bytes(b"aaaa")
     with gzip.open(str(bad / "binary.npy.gz"), "wb") as handle:
         handle.write(b"bbbb")
-    assert _compare_paths(bad / "binary.npy", bad / "binary.npy.gz").status is MISMATCH
+    assert resolve_pair(_hashed(bad / "binary.npy", bad / "binary.npy.gz")).status is MISMATCH
 
 
 def test_resolve_pair_names_both_sizes_on_a_truncated_member(tmp_path: Path) -> None:
@@ -640,10 +650,10 @@ def test_pool_deletes_a_match_before_the_run_finishes(tmp_path: Path) -> None:
     observed: list[tuple[bool, bool]] = []
     real = module._unlink_verified
 
-    def spy(result, quiet: bool) -> None:
-        real(result, quiet)
+    def spy(state, quiet: bool) -> None:
+        real(state, quiet)
         # Sampled after this pair's deletion: (this source still here?, slow here?).
-        observed.append((result.source.exists(), slow.exists()))
+        observed.append((state.source.path.exists(), slow.exists()))
 
     module.hash_file = delayed  # type: ignore[assignment]
     module._unlink_verified = spy  # type: ignore[assignment]
@@ -663,10 +673,25 @@ def test_unlink_verified_refuses_when_the_sibling_changed(tmp_path: Path) -> Non
     from dataset_manager.commands.check_gz import _unlink_verified
 
     source, gz = write_pair(tmp_path / "x", b"original")
+    state = _hashed(source, gz)
+    # Rewrite the sibling long after its digest was taken: the metadata fingerprint
+    # no longer matches, which is the signal the guard reads.
     with gzip.open(gz, "wb") as handle:
         handle.write(b"tampered")
 
-    _unlink_verified(Result(source=source, gz=gz, status=MATCH), quiet=True)
+    _unlink_verified(state, quiet=True)
+
+    assert source.exists()
+
+
+def test_unlink_verified_refuses_when_the_source_changed(tmp_path: Path) -> None:
+    from dataset_manager.commands.check_gz import _unlink_verified
+
+    source, gz = write_pair(tmp_path / "x", b"original")
+    state = _hashed(source, gz)
+    source.write_bytes(b"changed after the hash")
+
+    _unlink_verified(state, quiet=True)
 
     assert source.exists()
 
@@ -676,10 +701,22 @@ def test_unlink_verified_removes_a_still_matching_source(tmp_path: Path) -> None
 
     source, gz = write_pair(tmp_path / "x", b"original")
 
-    _unlink_verified(Result(source=source, gz=gz, status=MATCH), quiet=True)
+    _unlink_verified(_hashed(source, gz), quiet=True)
 
     assert not source.exists()
     assert gz.exists()
+
+
+def test_unlink_verified_refuses_when_the_sibling_is_gone(tmp_path: Path) -> None:
+    from dataset_manager.commands.check_gz import _unlink_verified
+
+    source, gz = write_pair(tmp_path / "x", b"original")
+    state = _hashed(source, gz)
+    gz.unlink()
+
+    _unlink_verified(state, quiet=True)
+
+    assert source.exists()
 
 
 # --- validation ---------------------------------------------------------------

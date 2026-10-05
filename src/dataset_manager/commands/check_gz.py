@@ -16,10 +16,12 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event
+from time import monotonic
 from typing import IO, Literal, cast
 
 from rich.console import Console
 from rich.status import Status as Spinner
+from rich.text import Text
 
 from ..app import app
 from ..hashing import HashCancelled, md5_stream
@@ -32,6 +34,17 @@ GZIP_SUFFIX = ".gz"
 # Read size for compression input only. Hashing does not use it: `md5_stream` reads
 # into a fixed block, and `GzipFile` re-blocks raw reads regardless.
 _COMPRESS_CHUNK = 1 << 20
+
+# Redraws per second for the live table. The default of 10 is imperceptible as
+# progress but reads as flicker next to any other output; one is enough to show a
+# multi-GB hash is still moving.
+_REFRESH_PER_SECOND = 1
+
+# Outcome lines printed while the table is live are buffered into a single
+# `console.print`: each print clears and redraws the whole region, so printing per
+# pair is what makes the table blink.
+_OUTCOME_BATCH = 8
+_FLUSH_INTERVAL_S = 0.5
 
 
 def compressed_path(source: Path) -> Path:
@@ -50,6 +63,14 @@ MISMATCH: Status = "MISMATCH"
 UNREADABLE: Status = "UNREADABLE"
 CANCELLED: Status = "CANCELLED"
 
+# Style per status; `_describe` returns the line, this its colour.
+_STYLES: dict[Status, str] = {
+    MATCH: "green",
+    MISMATCH: "red",
+    UNREADABLE: "yellow",
+    CANCELLED: "yellow",
+}
+
 Role = Literal["source", "gz"]
 
 
@@ -63,6 +84,9 @@ class FileTask:
     both of them poll. `expected` is the raw on-disk size, measured at construction
     so the bar has a total before hashing starts; `size` is what hashing actually
     read, which the comparison uses and which differs from `expected` for a `gz`.
+    `mtime_ns` is the file's modification time as of the hash, and together with
+    the post-hash `expected` it is the fingerprint `_unlink_verified` re-checks
+    before deleting a match.
     """
 
     path: Path
@@ -73,6 +97,7 @@ class FileTask:
     digest: str = ""
     size: int = 0
     error: str = ""
+    mtime_ns: int = 0
     task_id: object | None = None  # rich TaskID, set once the row exists
 
 
@@ -171,12 +196,19 @@ def hash_file(
 
     `on_progress` receives the bytes read from the file on disk (compressed bytes
     for a `.gz`), which is the only reading that closes against the file's size.
+
+    The open is followed by one `stat`, which refreshes `expected` to the real
+    on-disk size and records `mtime_ns`; the pair is then pinned to the exact file
+    that was hashed, which is what `_unlink_verified` checks before deleting.
     """
     fileobj: IO[bytes] | None = None
     raw: IO[bytes] | None = None
     try:
         fileobj, raw = _open(task.path)
         with fileobj:
+            info = os.stat(task.path)
+            task.expected = info.st_size
+            task.mtime_ns = info.st_mtime_ns
             task.digest, task.size = md5_stream(
                 fileobj,
                 cancelled=task.cancel.is_set,
@@ -286,27 +318,37 @@ def compress(
     return Compressed(source, gz, written, gz.stat().st_size)
 
 
-def _compare_paths(source: Path, gz: Path) -> Result:
-    """Hash both files in the calling thread and compare. No new threads."""
-    src = FileTask(source, "source", 0, Event())
-    gzp = FileTask(gz, "gz", 0, Event())
-    return resolve_pair(PairState(hash_file(src), hash_file(gzp)))
+def _unchanged(task: FileTask) -> bool:
+    """Whether the file still looks exactly as it did when it was hashed.
+
+    Size and `st_mtime_ns` against the values captured in `hash_file`. This is the
+    deletion guard, not the verification: the digests already proved the pair
+    identical, and this only has to catch the sibling or the source changing
+    between that proof and the `unlink`.
+    """
+    try:
+        info = task.path.stat()
+    except OSError:
+        return False
+    return info.st_size == task.expected and info.st_mtime_ns == task.mtime_ns
 
 
-def _unlink_verified(result: Result, quiet: bool) -> None:
+def _unlink_verified(state: PairState, quiet: bool) -> None:
     """Remove a source file whose compressed sibling was just proven identical.
 
     Called only with a MATCH from the comparison that just ran, so the premise is
     established, not assumed. Deletion is the one unrecoverable thing this command
-    can do, so the sibling is re-compared immediately before `unlink`: a concurrent
+    can do, so both files are re-stat'd immediately before `unlink`: a concurrent
     writer or a partially written sibling would otherwise let a stale match
-    destroy the last copy of the payload.
+    destroy the last copy of the payload. The sibling's digest is not recomputed —
+    re-hashing both files here cost as much as the verification itself (measured
+    1.00x on a 60 MiB pair) and blocked the join loop for its whole duration.
     """
-    source, gz = result.source, result.gz
+    source, gz = state.source.path, state.gz.path
     if not gz.is_file():
         log.warning(f"Refusing to delete {source}: {gz.name} is gone")
         return
-    if _compare_paths(source, gz).status is not MATCH:
+    if not (_unchanged(state.gz) and _unchanged(state.source)):
         log.warning(f"Refusing to delete {source}: {gz.name} changed since it was compared")
         return
     try:
@@ -394,21 +436,14 @@ def _sized(label: str, done: int, total: int) -> str:
     return f"{label} ({_bytes_to_str(done)}/{_bytes_to_str(total)})"
 
 
-def _describe(result: Result) -> tuple[str, str]:
-    """Line to print for a finished result: (rich style, text)."""
-    if result.status is MISMATCH:
-        return "red", f"{result.status}: {result.source}\n    {result.detail}"
-    if result.status is UNREADABLE:
-        return "yellow", f"{result.status}: {result.source}\n    {result.detail}"
-    if result.status is CANCELLED:
-        return "yellow", f"{result.status}: {result.source}\n    {result.detail}"
-    return (
-        "green",
-        (
+def _describe(result: Result) -> str:
+    """Line to print for a finished result. `_STYLES` carries its colour."""
+    if result.status is MATCH:
+        return (
             f"{result.status}: {result.source} "
             f"({_bytes_to_str(result.source_bytes)} raw, {_bytes_to_str(result.gz_bytes)} gz)"
-        ),
-    )
+        )
+    return f"{result.status}: {result.source}\n    {result.detail}"
 
 
 def _run_pool(
@@ -480,6 +515,9 @@ def _run_pool(
         total=total,
         derive_overall=False,
         show_percent=False,
+        # One redraw a second is enough for multi-GB files, whose byte counts move
+        # at most once per I/O block; the default 10 Hz just reads as flicker.
+        refresh_per_second=_REFRESH_PER_SECOND,
     )
 
     outcome = Outcome()
@@ -502,19 +540,41 @@ def _run_pool(
             description=_overall_description(outcome.settled, total),
         )
 
+    # Outcome lines are buffered and printed in one call: every `console.print`
+    # while the live region is up clears and redraws it, so one line per pair makes
+    # the whole table blink. A problem is worth a single blink, so anything that is
+    # not a MATCH flushes at once; MATCH lines wait for a batch or a second.
+    buffered: list[Text] = []
+    last_flush = monotonic()
+
+    def flush(force: bool = False) -> None:
+        nonlocal last_flush
+        if not buffered:
+            return
+        if not force and len(buffered) < _OUTCOME_BATCH and monotonic() - last_flush < _FLUSH_INTERVAL_S:
+            return
+        console.print(*buffered, highlight=False)
+        buffered.clear()
+        last_flush = monotonic()
+
+    def report(status: Status, line: str) -> None:
+        buffered.append(Text(line, style=_STYLES[status]))
+        flush(force=status is not MATCH)
+
     def emit(pair: PairState, result: Result) -> None:
+        # Count first: the pair is settled the moment it is known, and the overall
+        # bar must not wait behind the deletion below.
+        advance(pair)
         outcome.counts[result.status] += 1
         if result.status is not MATCH:
             outcome.bad = True
-        style, line = _describe(result)
         if result.status is not MATCH or not quiet:
-            console.print(line, style=style, highlight=False)
+            report(result.status, _describe(result))
         if result.status is MATCH and not keep:
             if dry_run:
                 log.info(f"[dry run] would delete {result.source}")
             else:
-                _unlink_verified(result, quiet)
-        advance(pair)
+                delete_pending.add(pool.submit(_unlink_verified, pair, quiet))
 
     def settle(pair: PairState) -> None:
         """Resolve a pair whose two hashes are both terminal, once."""
@@ -533,16 +593,19 @@ def _run_pool(
             # The total is the raw on-disk size measured at scan time, so the bar
             # advances from the first block; `on_progress` reports the offset into
             # the file on disk, which is why a `.gz` row totals its stored size.
-            def report(position: int) -> None:
+            def report_position(position: int) -> None:
                 tick(completed=position, description=_sized(f"Hashing {short(task.path)}", position, task.expected))
 
             tick = progress.add_task(_sized(f"Hashing {short(task.path)}", 0, task.expected), total=task.expected)
             rows[id(task)] = tick
             task.task_id = tick
-            return pool.submit(hash_file, task, on_progress=report)
+            return pool.submit(hash_file, task, on_progress=report_position)
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
             pending: dict[Future[FileTask], FileTask] = {submit(task): task for task in tasks}
+            # Deletions run on the same pool; they are fire-and-forget, drained
+            # each join round so their exceptions surface.
+            delete_pending: set[Future[None]] = set()
 
             while pending:
                 done, _ = wait(pending, return_when=FIRST_COMPLETED)
@@ -611,6 +674,15 @@ def _run_pool(
 
                     if terminal(state.source) and terminal(state.gz):
                         settle(state)
+
+                # Drain finished deletions: `future.result()` surfaces anything
+                # `_unlink_verified` raised; its own log lines are the report.
+                for delete_future in [f for f in delete_pending if f.done()]:
+                    delete_pending.discard(delete_future)
+                    delete_future.result()
+
+    # Nothing is live any more, so the remainder prints without redrawing a table.
+    flush(force=True)
 
     if outcome.counts:
         log.info(
