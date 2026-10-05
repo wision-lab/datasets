@@ -48,6 +48,9 @@ class UploadProgress(Progress):
         *args,
         auto_visible: bool = True,
         description: str = "[green]Overall progress:",
+        total: float = 0,
+        derive_overall: bool = True,
+        show_percent: bool = True,
         **kwargs,
     ) -> None:
         """
@@ -56,13 +59,31 @@ class UploadProgress(Progress):
                 worker first updates them and are hidden again once it finishes.
                 Defaults to True.
             description (str, optional): Description shown on the overall bar.
+            total (float, optional): Units of work the overall bar should be sized
+                against. When 0 the total is derived from the rows seen so far,
+                which is the only option for a caller that discovers its work as
+                it runs, but leaves the bar's fill meaningless until the work is
+                known. Callers that know the count up front pass it.
+            derive_overall (bool, optional): Whether the overall bar advances by
+                itself as chunk rows finish. True when one row is one unit of work
+                (upload). False when the caller's unit is not a row — `check-gz`
+                spends two hashing rows per pair, so a row-derived bar would run
+                to 100% after half the pairs — in which case the caller drives the
+                overall row itself.
+            show_percent (bool, optional): Whether to render a percentage column.
+                A caller that puts its own count in the description turns this off
+                rather than showing the same progress twice.
         """
         self.overall_taskid: TaskID | None = None
+        self.overall_total = total
+        self.derive_overall = derive_overall
         self.inflight_tasks: set[TaskID] = set()
         self.completed_tasks: set[TaskID] = set()
         self.auto_visible = auto_visible
         self.description = description
         super().__init__(*args, **kwargs)
+        if not show_percent:
+            self.columns = tuple(column for column in self.columns if not isinstance(column, TaskProgressColumn))
 
     @classmethod
     def get_default_columns(cls) -> tuple[ProgressColumn, ...]:
@@ -74,9 +95,21 @@ class UploadProgress(Progress):
             TimeRemainingColumn(elapsed_when_finished=True),
         )
 
+    @property
+    def overall_task(self) -> TaskID:
+        """The overall row's id. Only valid inside the `with` block.
+
+        The attribute is `None` before `__enter__`; callers that need the id (to
+        drive the row themselves) use this rather than reaching into the attribute
+        and asserting. A real raise, not `assert`: this guard must survive `-O`.
+        """
+        if self.overall_taskid is None:
+            raise RuntimeError("the progress display has not been entered")
+        return self.overall_taskid
+
     def __enter__(self) -> Self:
         self.start()
-        self.overall_taskid = super().add_task(self.description, total=0)
+        self.overall_taskid = super().add_task(self.description, total=self.overall_total)
         return self
 
     def __exit__(
@@ -118,12 +151,15 @@ class UploadProgress(Progress):
             self._update_overall()
 
     def _update_overall(self) -> None:
-        """Refresh the overall bar from finished chunks plus in-flight fractions."""
-        if self.overall_taskid is None:
+        """Refresh the overall bar from finished chunks plus in-flight fractions.
+
+        Skipped entirely when `derive_overall` is false: a caller whose unit of
+        work is not a row drives the overall row itself, because counting rows
+        here would run the bar ahead of its own description.
+        """
+        if self.overall_taskid is None or not self.derive_overall:
             return
         inflight = sum(self._tasks[t].percentage / 100 for t in self.inflight_tasks)
-        super().update(
-            self.overall_taskid,
-            completed=len(self.completed_tasks) + inflight,
-            total=len(self.completed_tasks) + len(self.inflight_tasks),
-        )
+        completed = len(self.completed_tasks) + inflight
+        total = self.overall_total or len(self.completed_tasks) + len(self.inflight_tasks)
+        super().update(self.overall_taskid, completed=completed, total=max(total, completed, 1))

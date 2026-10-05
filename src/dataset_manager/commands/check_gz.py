@@ -13,7 +13,7 @@ import os
 from collections import defaultdict
 from collections.abc import Callable, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event
 from typing import IO, Literal, cast
@@ -83,6 +83,21 @@ class PairState:
     source: FileTask
     gz: FileTask
     done: bool = False
+    counted: bool = False
+
+
+@dataclass(slots=True)
+class Outcome:
+    """Running totals for one `_run_pool` call, contributed to by its helpers.
+
+    A mutable object rather than bare locals the join and reporting helpers would
+    have to rebind through `nonlocal`: this is the single place the run's verdict
+    accumulates, and `bad` is what the exit code is derived from.
+    """
+
+    counts: dict[Status, int] = field(default_factory=lambda: defaultdict(int))
+    bad: bool = False
+    settled: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,7 +238,7 @@ def resolve_pair(state: PairState) -> Result:
 
 
 def compress(
-    source: Path, level: int = 9, force: bool = False, on_bytes: Callable[[int], None] | None = None
+    source: Path, level: int = 9, force: bool = False, on_progress: Callable[[int], None] | None = None
 ) -> Compressed:
     """Write `<source>.gz` the way `gzip -<level> -k` would: original kept, FNAME
     recorded, source mtime preserved.
@@ -235,6 +250,9 @@ def compress(
 
     Written to a temporary sibling and renamed, so an interrupted run never leaves
     a partial `.gz` that a later pass would treat as authoritative.
+
+    `on_progress` receives the source bytes written so far after each block, so a
+    bar can show the run against the file's size without tracking the delta itself.
     """
     gz = compressed_path(source)
     if gz.exists() and not force:
@@ -257,8 +275,8 @@ def compress(
             while chunk := fin.read(_COMPRESS_CHUNK):
                 gzfile.write(chunk)
                 written += len(chunk)
-                if on_bytes is not None:
-                    on_bytes(len(chunk))
+                if on_progress is not None:
+                    on_progress(written)
         tmp.replace(gz)
         # Match gzip -k, which leaves the .gz carrying the source file's timestamp.
         os.utime(gz, (src.st_atime, src.st_mtime))
@@ -357,6 +375,25 @@ def find_pairs(
             yield item
 
 
+def _overall_description(done: int, total: int) -> str:
+    """The overall bar's text: pairs settled out of pairs found, never a percentage.
+
+    A count is what tells the user whether the run is close to finishing; with
+    hours-long files a percentage of bytes looks stuck at 0% regardless.
+    """
+    return f"[green]Overall progress: {done}/{total} pair(s) completed"
+
+
+def _sized(label: str, done: int, total: int) -> str:
+    """A row's description with the bytes handled so far against the file's size.
+
+    The size belongs next to the name in the description: it is what tells a user
+    how far a multi-GB hash has actually got, in units that mean something when
+    the files in the tree differ by orders of magnitude.
+    """
+    return f"{label} ({_bytes_to_str(done)}/{_bytes_to_str(total)})"
+
+
 def _describe(result: Result) -> tuple[str, str]:
     """Line to print for a finished result: (rich style, text)."""
     if result.status is MISMATCH:
@@ -432,17 +469,43 @@ def _run_pool(
         pairs.append(state)
     scanned = len(pairs)
 
-    bad = False
-    matched = 0
-    counts: dict[Status, int] = defaultdict(int)
+    # One progress display for the whole pool, so the per-file rows and the
+    # overall row are created by the same object. The overall row is sized by the
+    # scan and driven by `advance` alone: a pair costs two hashing rows, so a
+    # row-derived bar would reach 100% after half the pairs. Its percentage column
+    # is dropped because its description carries the exact count.
+    total = len(entries)
+    progress = UploadProgress(
+        description=_overall_description(0, total),
+        total=total,
+        derive_overall=False,
+        show_percent=False,
+    )
 
-    def emit(result: Result) -> None:
-        nonlocal bad, matched
-        counts[result.status] += 1
-        if result.status is MATCH:
-            matched += 1
-        else:
-            bad = True
+    outcome = Outcome()
+
+    def advance(pair: PairState) -> None:
+        """Count one entry as processed, once, advancing the overall row.
+
+        Separate from reporting because the two do not coincide for
+        `--compress --no-check`: that entry is finished when its write lands,
+        with no comparison to report.
+        """
+        if pair.counted:
+            return
+        pair.counted = True
+        outcome.settled += 1
+        progress.update(
+            progress.overall_task,
+            completed=outcome.settled,
+            total=total,
+            description=_overall_description(outcome.settled, total),
+        )
+
+    def emit(pair: PairState, result: Result) -> None:
+        outcome.counts[result.status] += 1
+        if result.status is not MATCH:
+            outcome.bad = True
         style, line = _describe(result)
         if result.status is not MATCH or not quiet:
             console.print(line, style=style, highlight=False)
@@ -451,28 +514,32 @@ def _run_pool(
                 log.info(f"[dry run] would delete {result.source}")
             else:
                 _unlink_verified(result, quiet)
+        advance(pair)
 
-    def settle(state: PairState) -> None:
+    def settle(pair: PairState) -> None:
         """Resolve a pair whose two hashes are both terminal, once."""
-        if state.done:
+        if pair.done:
             return
-        state.done = True
-        emit(resolve_pair(state))
+        pair.done = True
+        emit(pair, resolve_pair(pair))
 
     def terminal(task: FileTask) -> bool:
         return bool(task.digest) or bool(task.error)
 
-    with UploadProgress(description="[green]Overall progress:") as progress:
+    with progress:
         rows: dict[int, UpdateFn] = {}
 
         def submit(task: FileTask) -> Future[FileTask]:
             # The total is the raw on-disk size measured at scan time, so the bar
-            # advances from the first block; `advance` reports decompressed bytes
-            # for a `.gz`, which is why the total is its compressed size.
-            tick = progress.add_task(f"Hashing {short(task.path)}", total=task.expected)
+            # advances from the first block; `on_progress` reports the offset into
+            # the file on disk, which is why a `.gz` row totals its stored size.
+            def report(position: int) -> None:
+                tick(completed=position, description=_sized(f"Hashing {short(task.path)}", position, task.expected))
+
+            tick = progress.add_task(_sized(f"Hashing {short(task.path)}", 0, task.expected), total=task.expected)
             rows[id(task)] = tick
             task.task_id = tick
-            return pool.submit(hash_file, task, on_progress=lambda pos: tick(completed=pos))
+            return pool.submit(hash_file, task, on_progress=report)
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
             pending: dict[Future[FileTask], FileTask] = {submit(task): task for task in tasks}
@@ -515,13 +582,22 @@ def _run_pool(
                                 force=force,
                                 quiet=quiet,
                             ):
-                                bad = True
+                                # A failed compression is still a finished entry:
+                                # count it, or the run ends reading N-1/N as if it
+                                # were still working.
+                                outcome.bad = True
+                                advance(state)
                                 continue
                             if not check:
+                                # Nothing to compare, so the entry is finished the
+                                # moment its write lands: count it, or the bar
+                                # would never leave zero in this mode.
+                                advance(state)
                                 continue
                             # Verify the write: hash the new `.gz` against the
                             # source digest already in hand, exactly like a
-                            # scanned pair.
+                            # scanned pair. The pair settles on that join, so an
+                            # entry is counted only once its bytes are proven.
                             gz_task = FileTask(
                                 compressed_path(task.path),
                                 "gz",
@@ -536,13 +612,13 @@ def _run_pool(
                     if terminal(state.source) and terminal(state.gz):
                         settle(state)
 
-    if counts:
+    if outcome.counts:
         log.info(
             f"{scanned} pair(s) checked with {workers} worker(s): "
-            f"{counts[MATCH]} match, {counts[MISMATCH]} mismatch, "
-            f"{counts[UNREADABLE]} unreadable, {counts[CANCELLED]} cancelled"
+            f"{outcome.counts[MATCH]} match, {outcome.counts[MISMATCH]} mismatch, "
+            f"{outcome.counts[UNREADABLE]} unreadable, {outcome.counts[CANCELLED]} cancelled"
         )
-    return 1 if bad else 0
+    return 1 if outcome.bad else 0
 
 
 def _compress_one(
@@ -558,13 +634,22 @@ def _compress_one(
     """Compress one sibling-less source, showing its own bar. True when it worked.
 
     `label` is the source path relative to the scan root, used for the bar so it
-    matches the `Hashing` rows.
+    matches the `Hashing` rows. The row itself is display only: the overall bar is
+    driven by `advance`, which counts the entry once the write succeeds (or fails)
+    rather than when this row is retired.
     """
-    tick = progress.add_task(f"Compressing {label}", total=task.expected)
+    # The row starts empty: `on_progress` reports the source bytes as they are
+    # read, so the bar and its size text track the actual stream rather than
+    # claiming the file is done before the first block is compressed.
+    tick = progress.add_task(_sized(f"Compressing {label}", 0, task.expected), total=task.expected)
+
+    def report(written: int) -> None:
+        tick(completed=written, description=_sized(f"Compressing {label}", written, task.expected))
+
     try:
-        result = compress(task.path, level=level, force=force, on_bytes=lambda chunk: tick(advance=chunk))
+        result = compress(task.path, level=level, force=force, on_progress=report)
     finally:
-        tick(completed=task.expected, visible=False)
+        tick(visible=False)
     if not result.ok:
         if not quiet:
             console.print(f"skipped {result.source}: {result.error}", style="yellow", highlight=False)

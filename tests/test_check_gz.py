@@ -2,14 +2,16 @@
 
 Scoped to the behaviours the command must not regress: the pair join and its
 cancellation, the compression-then-verify chain, the deletion guard, generality
-over `--name`, and the validation rules. Fixtures are kilobytes in `tmp_path`;
-nothing here touches the network.
+over `--name`, the validation rules, and the progress display (per-row sizes in
+the description, the overall completion count, and immediate deletion on a
+match). Fixtures are kilobytes in `tmp_path`; nothing here touches the network.
 """
 
 from __future__ import annotations
 
 import gzip
 import os
+import time
 from collections.abc import Buffer
 from pathlib import Path
 from threading import Event
@@ -35,6 +37,7 @@ from dataset_manager.commands.check_gz import (
     resolve_pair,
 )
 from dataset_manager.hashing import HashCancelled, md5_stream
+from dataset_manager.sizes import _bytes_to_str
 
 
 def write_pair(directory: Path, data: bytes = b"payload", *, name: str = "binary.npy") -> tuple[Path, Path]:
@@ -350,7 +353,8 @@ def test_hash_file_reports_bytes_read_for_a_plain_file(tmp_path: Path) -> None:
 
 def test_pool_rows_close_at_their_file_size(tmp_path: Path) -> None:
     # The regression this guards: rows used to be created with total=0 and only
-    # advanced, so every bar sat at 0%. Each row must now reach its own total.
+    # advanced, so every bar sat at 0%. Each row must reach its own total, and its
+    # description must carry the size it has handled against the file's size.
     data = b"abcdefgh" * 30_000
     source = make_pair(tmp_path, "z", data)
     stored = compressed_path(source).stat().st_size
@@ -358,7 +362,7 @@ def test_pool_rows_close_at_their_file_size(tmp_path: Path) -> None:
 
     from dataset_manager.progress import UploadProgress
 
-    rows: dict[str, tuple[float, float]] = {}
+    rows: dict[object, tuple[str, float, float]] = {}
     original = UploadProgress.update
 
     def spy(self, task_id, **kwargs):
@@ -366,9 +370,7 @@ def test_pool_rows_close_at_their_file_size(tmp_path: Path) -> None:
         if task_id != self.overall_taskid:
             with self._lock:
                 task = self._tasks[task_id]
-                total = task.total
-                done = max(rows.get(task.description, (total, 0.0))[1], task.completed)
-                rows[task.description] = (total, done)
+                rows[task_id] = (task.description, task.total, task.completed)
 
     UploadProgress.update = spy  # type: ignore[method-assign]
     try:
@@ -377,12 +379,133 @@ def test_pool_rows_close_at_their_file_size(tmp_path: Path) -> None:
         UploadProgress.update = original  # type: ignore[method-assign]
 
     assert rows, "no progress rows were observed"
-    totals = {d: t for d, (t, _) in rows.items()}
-    assert totals["Hashing z/binary.npy"] == len(data)
-    assert totals["Hashing z/binary.npy.gz"] == stored, "the gz row must total the stored size"
-    for description, (total, completed) in rows.items():
+    # Descriptions change as bytes flow, so key the last state by the row's name.
+    final = {description.split(" (")[0]: (description, total, done) for description, total, done in rows.values()}
+    source_row = final["Hashing z/binary.npy"]
+    gz_row = final["Hashing z/binary.npy.gz"]
+    assert source_row[1] == len(data)
+    assert gz_row[1] == stored, "the gz row must total the stored size"
+    assert _bytes_to_str(len(data)) in source_row[0], source_row[0]
+    assert _bytes_to_str(stored) in gz_row[0], gz_row[0]
+    for description, total, completed in final.values():
         assert total > 0, f"{description} had a zero total, so its bar cannot move"
         assert completed == total, f"{description} ended at {completed}/{total}"
+
+
+def test_overall_row_counts_completed_pairs(tmp_path: Path) -> None:
+    # The reported symptom: the overall bar showed a percentage, and it was the
+    # last row to finish rather than a count of pairs. It must now read
+    # `completed/total` and reach the total on the final pair.
+    make_pair(tmp_path, "a", b"identical")
+    make_pair(tmp_path, "b", b"identical")
+
+    from dataset_manager.progress import UploadProgress
+
+    descriptions: list[str] = []
+    original = UploadProgress.update
+
+    def spy(self, task_id, **kwargs):
+        original(self, task_id, **kwargs)
+        if task_id == self.overall_taskid:
+            with self._lock:
+                descriptions.append(self._tasks[task_id].description)
+
+    UploadProgress.update = spy  # type: ignore[method-assign]
+    try:
+        assert run(tmp_path, workers=2) == 0
+    finally:
+        UploadProgress.update = original  # type: ignore[method-assign]
+
+    assert descriptions[0].endswith("1/2 pair(s) completed"), descriptions
+    assert descriptions[-1].endswith("2/2 pair(s) completed"), descriptions
+    assert not any("%" in text for text in descriptions), "the overall row must not show a percentage"
+
+
+def test_overall_bar_fill_tracks_pairs_not_rows(tmp_path: Path) -> None:
+    # A pair costs two hashing rows, so a bar derived from row completions reaches
+    # 100% after roughly half the pairs and then sits there. The fill must agree
+    # with the count in its own description.
+    make_pair(tmp_path, "a", b"identical")
+    make_pair(tmp_path, "b", b"identical")
+
+    from dataset_manager.progress import UploadProgress
+
+    seen: list[tuple[float, float, str]] = []
+    original = UploadProgress.update
+
+    def spy(self, task_id, **kwargs):
+        original(self, task_id, **kwargs)
+        if task_id == self.overall_taskid:
+            with self._lock:
+                task = self._tasks[task_id]
+                seen.append((task.completed, task.total, task.description))
+
+    UploadProgress.update = spy  # type: ignore[method-assign]
+    try:
+        assert run(tmp_path, workers=2) == 0
+    finally:
+        UploadProgress.update = original  # type: ignore[method-assign]
+
+    assert seen, "the overall row never advanced"
+    for completed, total, description in seen:
+        assert total == 2, f"overall total drifted to {total}"
+        count = int(description.split(":")[1].split("/")[0])
+        assert completed == count, f"bar at {completed}/2 but description says {description}"
+    assert seen[-1][0] == 2
+
+
+def test_pool_counts_unchecked_compressions(tmp_path: Path) -> None:
+    # `--compress --no-check` has no comparison to report, so the entry is counted
+    # when the write lands. Dropping that `advance` would leave the bar at 0/N.
+    for name in ("a", "b"):
+        source = tmp_path / name / "binary.npy"
+        source.parent.mkdir(parents=True)
+        source.write_bytes(os.urandom(10_000))
+
+    from dataset_manager.progress import UploadProgress
+
+    seen: list[str] = []
+    original = UploadProgress.update
+
+    def spy(self, task_id, **kwargs):
+        original(self, task_id, **kwargs)
+        if task_id == self.overall_taskid:
+            with self._lock:
+                seen.append(self._tasks[task_id].description)
+
+    UploadProgress.update = spy  # type: ignore[method-assign]
+    try:
+        assert run(tmp_path, compress=True, check=False) == 0
+    finally:
+        UploadProgress.update = original  # type: ignore[method-assign]
+
+    assert seen[0].endswith("1/2 pair(s) completed"), seen
+    assert seen[-1].endswith("2/2 pair(s) completed"), seen
+
+
+def test_pool_rows_hide_once_finished(tmp_path: Path) -> None:
+    # The reported symptom: per-file bars reached 100% and stayed on screen. Each
+    # row must be retired when its file lands, leaving only the overall row.
+    make_pair(tmp_path, "a", b"identical")
+    make_pair(tmp_path, "b", b"identical")
+
+    from dataset_manager.progress import UploadProgress
+
+    final: dict[object, bool] = {}
+    original = UploadProgress.update
+
+    def spy(self, task_id, **kwargs):
+        original(self, task_id, **kwargs)
+        with self._lock:
+            final[task_id] = self._tasks[task_id].visible
+
+    UploadProgress.update = spy  # type: ignore[method-assign]
+    try:
+        assert run(tmp_path, workers=2) == 0
+    finally:
+        UploadProgress.update = original  # type: ignore[method-assign]
+
+    assert sum(final.values()) == 1, "only the overall row may remain visible"
 
 
 def test_hash_file_stops_when_the_pair_was_cancelled(tmp_path: Path) -> None:
@@ -459,6 +582,81 @@ def test_pool_reports_a_corrupt_compression(tmp_path: Path) -> None:
         module.compress = real  # type: ignore[assignment]
 
     assert rc == 1, "a verification mismatch must fail the run"
+
+
+def test_pool_counts_a_failed_compression(tmp_path: Path) -> None:
+    # A compression that fails (e.g. "already exists (use --force)") still finishes
+    # the entry: the run must not end reading N-1/N as though it were still busy.
+    siblingless = tmp_path / "alone" / "binary.npy"
+    siblingless.parent.mkdir(parents=True)
+    siblingless.write_bytes(os.urandom(10_000))
+
+    from dataset_manager.commands import check_gz as module
+    from dataset_manager.progress import UploadProgress
+
+    seen: list[str] = []
+    original_update = UploadProgress.update
+
+    def spy(self, task_id, **kwargs):
+        original_update(self, task_id, **kwargs)
+        if task_id == self.overall_taskid:
+            with self._lock:
+                seen.append(self._tasks[task_id].description)
+
+    real = module._compress_one
+    module._compress_one = lambda *args, **kwargs: False  # type: ignore[assignment]
+    UploadProgress.update = spy  # type: ignore[method-assign]
+    try:
+        assert run(tmp_path, compress=True) == 1
+    finally:
+        module._compress_one = real  # type: ignore[assignment]
+        UploadProgress.update = original_update  # type: ignore[method-assign]
+
+    assert seen and seen[-1].endswith("1/1 pair(s) completed"), seen
+
+
+def test_pool_deletes_a_match_before_the_run_finishes(tmp_path: Path) -> None:
+    # Deletion follows the check that proved the pair identical, not the end of
+    # the run. The slow pair's hashing is delayed so the fast pair is provably
+    # resolved first: when its deletion lands, the slow source must still be on
+    # disk. A run that batched deletions until the end would show it already gone.
+    slow = tmp_path / "slow" / "binary.npy"
+    slow.parent.mkdir(parents=True)
+    data = os.urandom(4 * 1024 * 1024)
+    slow.write_bytes(data)
+    with gzip.open(compressed_path(slow), "wb") as handle:
+        handle.write(data)
+    make_pair(tmp_path, "fast", b"identical")
+
+    from dataset_manager.commands import check_gz as module
+
+    real_hash = module.hash_file
+
+    def delayed(task, **kwargs):
+        if task.path == slow:
+            time.sleep(1.0)
+        return real_hash(task, **kwargs)
+
+    observed: list[tuple[bool, bool]] = []
+    real = module._unlink_verified
+
+    def spy(result, quiet: bool) -> None:
+        real(result, quiet)
+        # Sampled after this pair's deletion: (this source still here?, slow here?).
+        observed.append((result.source.exists(), slow.exists()))
+
+    module.hash_file = delayed  # type: ignore[assignment]
+    module._unlink_verified = spy  # type: ignore[assignment]
+    try:
+        assert run(tmp_path, workers=2, keep=False) == 0
+    finally:
+        module.hash_file = real_hash  # type: ignore[assignment]
+        module._unlink_verified = real  # type: ignore[assignment]
+
+    assert observed, "no deletion observed"
+    assert observed[0] == (False, True), "the match must be deleted while the run is still going"
+    assert all(not still_here for still_here, _ in observed), "every match must be deleted"
+    assert not slow.exists()
 
 
 def test_unlink_verified_refuses_when_the_sibling_changed(tmp_path: Path) -> None:
