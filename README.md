@@ -47,7 +47,7 @@ Below we include folder-wise descriptions (of directories under `sequences`), pa
 * `qbp`: sequences associated with [Ma et al., SIGGRAPH 2020](https://arxiv.org/abs/2006.11840). Hotpixel mask for all sequences is `hot_pixel_mask/SwissSPAD_ddr3_mode.npy`. Sequences captured at 10--16 kHz.
 * `vision`: sequences associated with [Ma et al., WACV 2023](https://openaccess.thecvf.com/content/WACV2023/papers/Ma_Burst_Vision_Using_Single-Photon_Cameras_WACV_2023_paper.pdf). Hotpixel mask for all sequences is `hot_pixel_mask/SwissSPAD_continuous_stream.npy`. Most sequences were captured at 10--16 kHz.
 
-*Update 09/2026:* These datasets were moved from `DATASET_PREFIX=quanta-vision/sequences/*` to `DATASET_PREFIX=quantavision/*` to conform with the updated upload scripts, the individual trees have also been pushed to this repo.
+*Update 09/2026:* These datasets are being moved from `DATASET_PREFIX=quanta-vision/sequences/*` to `DATASET_PREFIX=quantavision/*` to conform with the updated upload scripts, the individual trees will also been pushed to this repo. In the meantime, the old location is still available.
 
 <details>
 <summary>See Detailed Folder Structure</summary>
@@ -516,3 +516,15 @@ Tree<'xvfi.json'>
 *Tip:* To see the full details for each split, you can use the `show-tree` like so `uv run dataset-manager show-tree trees/quanta-neural-networks/xvfi.json --full`. To generate the tree with direct download links, use `uv run dataset-manager show-tree trees/quanta-neural-networks/xvfi.json --s3-prefix quanta-neural-networks`. Use `--html` to render links as HTML `<a>` tags (needed inside `<details>` tags).
 
 </details>
+
+
+## Probabilistic Events
+
+Simulated datasets associated with [Probabilistic Events](https://wisionlab.com/project/probabilistic-events/). Unlike the other simulated datasets these are distributed as two archives, so there is no folder tree — download them directly:
+
+* [`night-driving.tar.xz`](https://web.s3.wisc.edu/public-datasets/probabilistic-events/night-driving.tar.xz) (3.7G)
+* [`visionsim.tar.gz`](https://web.s3.wisc.edu/public-datasets/probabilistic-events/visionsim.tar.gz) (10.9G)
+
+To download both, use the above script with `DATASET_PREFIX=probabilistic-events`.
+
+*Note:* The archive sizes refer to the compressed download size (14.6G total).
