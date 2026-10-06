@@ -10,6 +10,8 @@ match). Fixtures are kilobytes in `tmp_path`; nothing here touches the network.
 from __future__ import annotations
 
 import gzip
+import io
+import logging
 import os
 import time
 from collections.abc import Buffer
@@ -542,6 +544,72 @@ def test_resolve_pair_reports_cancelled_when_the_peer_stopped_early(tmp_path: Pa
     gz_task = FileTask(compressed_path(source), "gz", 0, Event(), error="EOFError: broken")
 
     assert resolve_pair(PairState(source_task, gz_task)).status is UNREADABLE
+
+
+def test_hash_file_logs_a_traceback_when_the_read_fails(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    # A recorded `OSError: [Errno N] ...` does not say which call raised it, and on
+    # a network mount that is the whole diagnosis. The failing operation must be
+    # recoverable from the log alone.
+    source = tmp_path / "binary.npy"
+    source.write_bytes(b"payload")
+    task = FileTask(source, "source", 0, Event(), expected=7)
+
+    from dataset_manager.commands import check_gz as module
+
+    real = module.md5_stream
+
+    def boom(*args, **kwargs):
+        raise OSError(22, "Invalid argument")
+
+    module.md5_stream = boom  # type: ignore[assignment]
+    try:
+        with caplog.at_level(logging.WARNING):
+            result = hash_file(task)
+    finally:
+        module.md5_stream = real  # type: ignore[assignment]
+
+    assert result.error == "OSError: [Errno 22] Invalid argument"
+    record = next(r for r in caplog.records if r.levelno == logging.WARNING)
+    assert str(source) in record.getMessage()
+    assert record.exc_info is not None
+    assert record.exc_info[0] is OSError
+
+
+def test_hash_file_records_a_close_failure_instead_of_raising(tmp_path: Path) -> None:
+    # `raw` is closed outside the `except` handlers, so a close that fails used to
+    # escape `hash_file` and kill the run rather than reporting one bad file.
+    source = tmp_path / "binary.npy"
+    source.write_bytes(b"payload")
+
+    class BadClose(io.RawIOBase):
+        def readinto(self, buffer):
+            buffer[:3] = b"abc"
+            return 3
+
+        def close(self):
+            super().close()
+            raise OSError(22, "Invalid argument")
+
+    class FakeGzip:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def readinto(self, buffer):
+            return 0
+
+    from dataset_manager.commands import check_gz as module
+
+    real = module._open
+    module._open = lambda path: (FakeGzip(), BadClose())  # type: ignore[assignment,return-value]
+    try:
+        result = hash_file(FileTask(source, "source", 0, Event(), expected=7))
+    finally:
+        module._open = real  # type: ignore[assignment]
+
+    assert result.error == "OSError: [Errno 22] Invalid argument"
 
 
 def test_pool_early_stops_the_sibling_of_a_failed_hash(tmp_path: Path) -> None:

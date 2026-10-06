@@ -219,10 +219,21 @@ def hash_file(
         task.error = "stopped early: the other file of the pair failed"
     except (OSError, EOFError, gzip.BadGzipFile) as exc:
         task.error = f"{type(exc).__name__}: {exc}"
+        # The recorded string names the exception but not the call that raised it,
+        # and on a network mount the difference between a failed open, a failed
+        # read and a failed close is the whole diagnosis. Log the traceback once,
+        # here, where the failing operation is still on the stack.
+        log.warning(f"Failed to hash {task.path}", exc_info=exc)
     finally:
         # A `GzipFile` does not close the file it was handed, so close it here.
+        # A close failure would otherwise escape the handlers above — the `with`
+        # closes `fileobj`, but `raw` is closed only here, outside them.
         if raw is not None and not raw.closed:
-            raw.close()
+            try:
+                raw.close()
+            except OSError as exc:
+                log.warning(f"Failed to close {task.path}", exc_info=exc)
+                task.error = task.error or f"{type(exc).__name__}: {exc}"
     return task
 
 
