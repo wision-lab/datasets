@@ -618,79 +618,93 @@ def _run_pool(
             # each join round so their exceptions surface.
             delete_pending: set[Future[None]] = set()
 
-            while pending:
-                done, _ = wait(pending, return_when=FIRST_COMPLETED)
-                for future in done:
-                    task = pending.pop(future)
-                    future.result()  # hash_file records failures on the task; nothing raises
-                    tick = rows.pop(id(task))
-                    # Retire the row as-is: progress already reached the file's
-                    # size via `on_progress`, so nothing needs to be invented here.
-                    tick(visible=False)
-                    state = pairs[task.pair]
+            # Ctrl-C lands in whichever thread is running, including a worker, so
+            # without this the live region is never torn down and the process dies
+            # inside rich's `excepthook` instead of reporting what it managed to do.
+            try:
+                while pending:
+                    done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        task = pending.pop(future)
+                        future.result()  # hash_file records failures on the task; nothing raises
+                        tick = rows.pop(id(task))
+                        # Retire the row as-is: progress already reached the file's
+                        # size via `on_progress`, so nothing needs to be invented here.
+                        tick(visible=False)
+                        state = pairs[task.pair]
 
-                    if task.error and not task.error.startswith("stopped early"):
-                        # Cancel the sibling: `future.cancel()` drops it if it has
-                        # not started, and the shared event stops it within one
-                        # block if it has.
-                        task.cancel.set()
-                        for other_future, other_task in pending.items():
-                            if other_task is not task and other_task.pair == task.pair:
-                                other_future.cancel()
+                        if task.error and not task.error.startswith("stopped early"):
+                            # Cancel the sibling: `future.cancel()` drops it if it has
+                            # not started, and the shared event stops it within one
+                            # block if it has.
+                            task.cancel.set()
+                            for other_future, other_task in pending.items():
+                                if other_task is not task and other_task.pair == task.pair:
+                                    other_future.cancel()
 
-                    if state.source is not task and state.gz is not task:
-                        # A file whose compression already failed: reported then.
-                        continue
-
-                    if task.pair in spare and task.role == "source":
-                        # The scanned hash of a file with no sibling just landed.
-                        if task.error:
+                        if state.source is not task and state.gz is not task:
+                            # A file whose compression already failed: reported then.
                             continue
-                        if compress:
-                            if not _compress_one(
-                                console,
-                                progress,
-                                task,
-                                label=short(task.path),
-                                level=level,
-                                force=force,
-                                quiet=quiet,
-                            ):
-                                # A failed compression is still a finished entry:
-                                # count it, or the run ends reading N-1/N as if it
-                                # were still working.
-                                outcome.bad = True
-                                advance(state)
-                                continue
-                            if not check:
-                                # Nothing to compare, so the entry is finished the
-                                # moment its write lands: count it, or the bar
-                                # would never leave zero in this mode.
-                                advance(state)
-                                continue
-                            # Verify the write: hash the new `.gz` against the
-                            # source digest already in hand, exactly like a
-                            # scanned pair. The pair settles on that join, so an
-                            # entry is counted only once its bytes are proven.
-                            gz_task = FileTask(
-                                compressed_path(task.path),
-                                "gz",
-                                task.pair,
-                                Event(),
-                                expected=_safe_size(compressed_path(task.path)),
-                            )
-                            state.gz = gz_task
-                            pending[submit(gz_task)] = gz_task
-                        continue
 
-                    if terminal(state.source) and terminal(state.gz):
-                        settle(state)
+                        if task.pair in spare and task.role == "source":
+                            # The scanned hash of a file with no sibling just landed.
+                            if task.error:
+                                continue
+                            if compress:
+                                if not _compress_one(
+                                    console,
+                                    progress,
+                                    task,
+                                    label=short(task.path),
+                                    level=level,
+                                    force=force,
+                                    quiet=quiet,
+                                ):
+                                    # A failed compression is still a finished entry:
+                                    # count it, or the run ends reading N-1/N as if it
+                                    # were still working.
+                                    outcome.bad = True
+                                    advance(state)
+                                    continue
+                                if not check:
+                                    # Nothing to compare, so the entry is finished the
+                                    # moment its write lands: count it, or the bar
+                                    # would never leave zero in this mode.
+                                    advance(state)
+                                    continue
+                                # Verify the write: hash the new `.gz` against the
+                                # source digest already in hand, exactly like a
+                                # scanned pair. The pair settles on that join, so an
+                                # entry is counted only once its bytes are proven.
+                                gz_task = FileTask(
+                                    compressed_path(task.path),
+                                    "gz",
+                                    task.pair,
+                                    Event(),
+                                    expected=_safe_size(compressed_path(task.path)),
+                                )
+                                state.gz = gz_task
+                                pending[submit(gz_task)] = gz_task
+                            continue
 
-                # Drain finished deletions: `future.result()` surfaces anything
-                # `_unlink_verified` raised; its own log lines are the report.
-                for delete_future in [f for f in delete_pending if f.done()]:
-                    delete_pending.discard(delete_future)
-                    delete_future.result()
+                        if terminal(state.source) and terminal(state.gz):
+                            settle(state)
+
+                    # Drain finished deletions: `future.result()` surfaces anything
+                    # `_unlink_verified` raised; its own log lines are the report.
+                    for delete_future in [f for f in delete_pending if f.done()]:
+                        delete_pending.discard(delete_future)
+                        delete_future.result()
+            except KeyboardInterrupt:
+                # A worker thread takes the interrupt as often as the main one, so
+                # without this the live region is never torn down and the process
+                # dies inside rich's `excepthook` instead of reporting progress.
+                # Stopping is the whole contract here; the summary below reports
+                # what did complete.
+                for future, task in pending.items():
+                    task.cancel.set()
+                    future.cancel()
+                log.warning(f"Interrupted with {len(pending)} file(s) outstanding")
 
     # Nothing is live any more, so the remainder prints without redrawing a table.
     flush(force=True)
