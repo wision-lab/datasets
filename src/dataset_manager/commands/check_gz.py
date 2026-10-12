@@ -530,6 +530,10 @@ def _run_pool(
     # is dropped because its description carries the exact count.
     total = len(entries)
     progress = UploadProgress(
+        # The same console the outcome lines print through: a second `Console` on
+        # the same fd is outside the live region, so its prints were immediately
+        # painted over by the next table refresh.
+        console=console,
         description=_overall_description(0, total),
         total=total,
         derive_overall=False,
