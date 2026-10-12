@@ -266,6 +266,23 @@ def test_compress_writes_beside_the_source_and_preserves_mtime(tmp_path: Path) -
         assert handle.read() == source.read_bytes()
 
 
+def test_compress_leaves_no_temp_behind_when_interrupted(tmp_path: Path) -> None:
+    # Ctrl-C is a `BaseException`, not an `OSError`, so an interrupted compression
+    # used to leave a `.tmp` the size of the source beside every file it was
+    # writing. The `.gz` must not exist either: only the rename makes it real.
+    source = tmp_path / "x"
+    source.write_bytes(b"payload" * 1000)
+
+    def interrupt(_written: int) -> None:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        compress(source, on_progress=interrupt)
+
+    assert not list(tmp_path.glob("*.tmp"))
+    assert not compressed_path(source).exists()
+
+
 def test_compress_skips_an_existing_target_unless_forced(tmp_path: Path) -> None:
     source = tmp_path / "x"
     source.write_bytes(b"payload")
@@ -681,16 +698,50 @@ def test_pool_counts_a_failed_compression(tmp_path: Path) -> None:
             with self._lock:
                 seen.append(self._tasks[task_id].description)
 
-    real = module._compress_one
-    module._compress_one = lambda *args, **kwargs: False  # type: ignore[assignment]
+    real = module.compress
+    module.compress = lambda *args, **kwargs: Compressed(  # type: ignore[assignment]
+        siblingless, compressed_path(siblingless), 0, 0, error="already exists (use --force)"
+    )
     UploadProgress.update = spy  # type: ignore[method-assign]
     try:
         assert run(tmp_path, compress=True) == 1
     finally:
-        module._compress_one = real  # type: ignore[assignment]
+        module.compress = real  # type: ignore[assignment]
         UploadProgress.update = original_update  # type: ignore[method-assign]
 
     assert seen and seen[-1].endswith("1/1 pair(s) completed"), seen
+
+
+def test_compression_runs_on_the_pool_with_a_live_row(tmp_path: Path) -> None:
+    # A compression submitted to the pool must still own a visible, advancing row:
+    # run inline it blocked the join loop, and the row is what tells a user a
+    # multi-GB write is moving. The tick is driven by the worker via `on_progress`.
+    (tmp_path / "alone").mkdir()
+    source = tmp_path / "alone" / "binary.npy"
+    source.write_bytes(os.urandom(3 * 1024 * 1024))
+
+    from dataset_manager.progress import UploadProgress
+
+    seen: list[tuple[object, bool, str]] = []
+    original = UploadProgress.update
+
+    def spy(self, task_id, **kwargs):
+        original(self, task_id, **kwargs)
+        with self._lock:
+            seen.append((kwargs.get("completed"), self._tasks[task_id].visible, self._tasks[task_id].description))
+
+    UploadProgress.update = spy  # type: ignore[method-assign]
+    try:
+        assert run(tmp_path, workers=2, compress=True) == 0
+    finally:
+        UploadProgress.update = original  # type: ignore[method-assign]
+
+    rows = [s for s in seen if s[2].startswith("Compressing")]
+    assert rows, "a compression must render its own row"
+    assert any(visible for _, visible, _ in rows), "the row must become visible"
+    assert any(completed for completed, _, _ in rows), "the bar must advance while the write runs"
+    assert rows[-1][1] is False, "the row must be retired when the write lands"
+    assert compressed_path(source).exists()
 
 
 def test_pool_deletes_a_match_before_the_run_finishes(tmp_path: Path) -> None:

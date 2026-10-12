@@ -326,6 +326,14 @@ def compress(
     except OSError as exc:
         tmp.unlink(missing_ok=True)
         return Compressed(source, gz, 0, 0, error=f"{type(exc).__name__}: {exc}")
+    except BaseException:
+        # Ctrl-C is a `BaseException`, not an `OSError`, and it lands in a worker
+        # as often as the main thread: without this a killed run leaves a
+        # multi-GB `.tmp` beside every source it was compressing. The rename below
+        # is what makes the target authoritative, so discarding a partial temp is
+        # always safe.
+        tmp.unlink(missing_ok=True)
+        raise
     return Compressed(source, gz, written, gz.stat().st_size)
 
 
@@ -617,13 +625,16 @@ def _run_pool(
             # Deletions run on the same pool; they are fire-and-forget, drained
             # each join round so their exceptions surface.
             delete_pending: set[Future[None]] = set()
+            # In-flight compressions: submitted like hashes so a multi-GB write
+            # cannot block the join loop and freeze the display.
+            compressions: dict[Future[Compressed], tuple[FileTask, UpdateFn]] = {}
 
             # Ctrl-C lands in whichever thread is running, including a worker, so
             # without this the live region is never torn down and the process dies
             # inside rich's `excepthook` instead of reporting what it managed to do.
             try:
-                while pending:
-                    done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                while pending or compressions:
+                    done, _ = wait(pending, return_when=FIRST_COMPLETED) if pending else (set(), set())
                     for future in done:
                         task = pending.pop(future)
                         future.result()  # hash_file records failures on the task; nothing raises
@@ -651,40 +662,15 @@ def _run_pool(
                             if task.error:
                                 continue
                             if compress:
-                                if not _compress_one(
-                                    console,
+                                compress_future, compress_tick = _submit_compression(
+                                    pool,
                                     progress,
                                     task,
                                     label=short(task.path),
                                     level=level,
                                     force=force,
-                                    quiet=quiet,
-                                ):
-                                    # A failed compression is still a finished entry:
-                                    # count it, or the run ends reading N-1/N as if it
-                                    # were still working.
-                                    outcome.bad = True
-                                    advance(state)
-                                    continue
-                                if not check:
-                                    # Nothing to compare, so the entry is finished the
-                                    # moment its write lands: count it, or the bar
-                                    # would never leave zero in this mode.
-                                    advance(state)
-                                    continue
-                                # Verify the write: hash the new `.gz` against the
-                                # source digest already in hand, exactly like a
-                                # scanned pair. The pair settles on that join, so an
-                                # entry is counted only once its bytes are proven.
-                                gz_task = FileTask(
-                                    compressed_path(task.path),
-                                    "gz",
-                                    task.pair,
-                                    Event(),
-                                    expected=_safe_size(compressed_path(task.path)),
                                 )
-                                state.gz = gz_task
-                                pending[submit(gz_task)] = gz_task
+                                compressions[compress_future] = (task, compress_tick)
                             continue
 
                         if terminal(state.source) and terminal(state.gz):
@@ -695,6 +681,48 @@ def _run_pool(
                     for delete_future in [f for f in delete_pending if f.done()]:
                         delete_pending.discard(delete_future)
                         delete_future.result()
+
+                    # Settle every compression that finished this round: the entry
+                    # is counted here, now that the write is known to have landed.
+                    for compress_future in [f for f in compressions if f.done()]:
+                        compress_task, compress_tick = compressions.pop(compress_future)
+                        compress_tick(visible=False)
+                        state = pairs[compress_task.pair]
+                        result = compress_future.result()
+                        if not result.ok:
+                            # A failed compression is still a finished entry: count
+                            # it, or the run ends reading N-1/N as if it were busy.
+                            outcome.bad = True
+                            advance(state)
+                            if not quiet:
+                                report(UNREADABLE, f"compression failed: {result.source}\n    {result.error}")
+                            continue
+                        if not quiet:
+                            ratio = f" ({result.gz_bytes / result.src_bytes:.0%})" if result.src_bytes else ""
+                            report(
+                                MATCH,
+                                f"compressed {result.source.name} -> {result.gz.name} "
+                                f"{_bytes_to_str(result.gz_bytes)}{ratio}",
+                            )
+                        if not check:
+                            # Nothing to compare, so the entry is finished the moment
+                            # its write lands: count it, or the bar would never leave
+                            # zero in this mode.
+                            advance(state)
+                            continue
+                        # Verify the write: hash the new `.gz` against the source
+                        # digest already in hand, exactly like a scanned pair. The
+                        # pair settles on that join, so an entry is counted only once
+                        # its bytes are proven.
+                        gz_task = FileTask(
+                            compressed_path(compress_task.path),
+                            "gz",
+                            compress_task.pair,
+                            Event(),
+                            expected=_safe_size(compressed_path(compress_task.path)),
+                        )
+                        state.gz = gz_task
+                        pending[submit(gz_task)] = gz_task
             except KeyboardInterrupt:
                 # A worker thread takes the interrupt as often as the main one, so
                 # without this the live region is never torn down and the process
@@ -718,47 +746,31 @@ def _run_pool(
     return 1 if outcome.bad else 0
 
 
-def _compress_one(
-    console: Console,
+def _submit_compression(
+    pool: ThreadPoolExecutor,
     progress: UploadProgress,
     task: FileTask,
     *,
     label: str,
     level: int,
     force: bool,
-    quiet: bool,
-) -> bool:
-    """Compress one sibling-less source, showing its own bar. True when it worked.
+) -> tuple[Future[Compressed], UpdateFn]:
+    """Start one compression on the pool; return its future and its row's callback.
 
-    `label` is the source path relative to the scan root, used for the bar so it
-    matches the `Hashing` rows. The row itself is display only: the overall bar is
-    driven by `advance`, which counts the entry once the write succeeds (or fails)
-    rather than when this row is retired.
+    The row is created here, on the caller's thread, so the display stays
+    single-threaded, and the write happens in a worker like every hash does. Run
+    inline it blocked the join loop for the length of a level-9 write, so finished
+    rows stayed visible at 100% and the overall count stood still until it
+    returned. `on_progress` reports the source bytes as they are read, so the bar
+    tracks the stream instead of claiming the file is done before the first block.
     """
-    # The row starts empty: `on_progress` reports the source bytes as they are
-    # read, so the bar and its size text track the actual stream rather than
-    # claiming the file is done before the first block is compressed.
     tick = progress.add_task(_sized(f"Compressing {label}", 0, task.expected), total=task.expected)
 
     def report(written: int) -> None:
         tick(completed=written, description=_sized(f"Compressing {label}", written, task.expected))
 
-    try:
-        result = compress(task.path, level=level, force=force, on_progress=report)
-    finally:
-        tick(visible=False)
-    if not result.ok:
-        if not quiet:
-            console.print(f"skipped {result.source}: {result.error}", style="yellow", highlight=False)
-        return False
-    if not quiet:
-        ratio = f" ({result.gz_bytes / result.src_bytes:.0%})" if result.src_bytes else ""
-        console.print(
-            f"compressed {result.source.name} -> {result.gz.name} {_bytes_to_str(result.gz_bytes)}{ratio}",
-            style="cyan",
-            highlight=False,
-        )
-    return True
+    future = pool.submit(compress, task.path, level=level, force=force, on_progress=report)
+    return future, tick
 
 
 @app.command
