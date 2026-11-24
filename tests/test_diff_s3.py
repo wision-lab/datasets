@@ -149,6 +149,19 @@ def test_archive_members_land_under_the_archive_parent_directory(prefix: Prefix)
     assert set(fake.get_object_keys) == {"data/a/x/part_0.zip"}
 
 
+def test_archive_members_carrying_the_prefix_leaf_are_stripped() -> None:
+    """A member prefixed with the operand's last component maps to the extracted layout.
+
+    The README flow syncs `.../vision` into a download dir and extracts each `vision_N.zip`
+    in place, so members read `vision/<seq>/<file>` while the local tree is `<seq>/<file>`.
+    """
+    archive = zip_bytes({"vision/0505-bicycle-1/a.npy": b"image-one"})
+    fake = FakeS3("test-bucket", {"quantavision/vision/vision_0.zip": archive})
+
+    files = collect(fake, Prefix(bucket="test-bucket", prefix="quantavision/vision"))
+    assert sorted(files) == ["0505-bicycle-1/a.npy"]
+
+
 def test_a_local_copy_of_the_same_tree_produces_the_same_virtual_keys(tmp_path: Path, prefix: Prefix) -> None:
     """The S3 operand and a local extracted copy agree key-for-key, which is the whole point.
 
@@ -204,3 +217,25 @@ def test_a_corrupt_archive_falls_back_to_a_loose_object(prefix: Prefix) -> None:
     files = collect(fake, prefix)
     assert files["broken.zip"].kind == "file", "a failed archive must not disappear from the comparison"
     assert files["broken.zip"].size == 16
+
+
+def test_a_suffixless_zip_is_reported_as_misnamed(prefix: Prefix) -> None:
+    """A `merge_ratio` folder archive, keyed after its folder, is flagged for renaming.
+
+    `upload` writes such an archive under the folder's own key, so it has no `.zip`
+    suffix to classify it by; probing the first bytes recovers that, while a real loose
+    file and an already-suffixed archive are left alone.
+    """
+    archive = zip_bytes({"cam/binary.npy": b"image-one"})
+    fake = FakeS3(
+        "test-bucket",
+        {"data/cam": archive, "data/notes.txt": b"plain", "data/ok.zip": archive},
+    )
+    tree = _collect_virtual_files(s3_client=cast("S3Client", fake), location=prefix, workers=2)
+    assert tree.misnamed_archives == ["data/cam"]
+
+
+def test_a_suffixless_non_zip_is_not_reported(prefix: Prefix) -> None:
+    fake = FakeS3("test-bucket", {"data/notes.txt": b"plain", "data/raw.bin": b"\x00\x01\x02\x03"})
+    tree = _collect_virtual_files(s3_client=cast("S3Client", fake), location=prefix, workers=2)
+    assert tree.misnamed_archives == []

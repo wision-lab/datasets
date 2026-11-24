@@ -90,7 +90,7 @@ def zip_nodes(tree: Tree) -> list[Node]:
 
 
 def zip_entries(tree: Tree) -> list[tuple[str, bool, int]]:
-    """(name, is_dir, size) of every archive, sorted; `is_dir` marks a kept folder."""
+    """(name, is_dir, size) of every archive, sorted."""
     return sorted((n.data.path.name, bool(n.data.is_dir), n.data.size or 0) for n in zip_nodes(tree))
 
 
@@ -113,9 +113,10 @@ def archive_names(tree: Tree) -> list[str]:
 
 @pytest.mark.parametrize("strategy", STRATEGIES)
 def test_merge_keeps_the_folder_as_archive_root(oversized_folder: Tree, strategy: ChunkStrategy) -> None:
+    """The merge archives the folder as `<name>.zip`, without an extra nesting level."""
     tree = split_into_chunks(tree=oversized_folder, chunk_size=CHUNK, strategy=strategy, merge_ratio=RATIO)
 
-    assert ("cam", True, 122) in zip_entries(tree)
+    assert ("cam.zip", False, 122) in zip_entries(tree)
     assert not any(name.startswith("cam_") for name in archive_names(tree)), "no extra nesting level"
     assert sorted(c.data.path.name for c in archive_of(tree, "binary.npy").children) == [
         "arguments.json",
@@ -149,8 +150,8 @@ def test_merge_budget_covers_the_supporting_files(tmp_path: Path, strategy: Chun
         tree=make_oversized_folder(tmp_path), chunk_size=CHUNK, strategy=strategy, merge_ratio=0.12
     )
 
-    assert ("cam", True, 122) not in zip_entries(tight), "10 bytes of budget is too little for 12 bytes"
-    assert ("cam", True, 122) in zip_entries(loose), "12 bytes of budget covers 12 bytes"
+    assert ("cam.zip", False, 122) not in zip_entries(tight), "10 bytes of budget is too little for 12 bytes"
+    assert ("cam.zip", False, 122) in zip_entries(loose), "12 bytes of budget covers 12 bytes"
 
 
 @pytest.mark.parametrize("strategy", STRATEGIES)
@@ -198,12 +199,14 @@ def test_every_file_lands_in_exactly_one_archive(
 
 
 def test_merge_archives_only_the_folder_tree(oversized_folder: Tree) -> None:
-    """The kept folder archives its own children, reproducing the original layout."""
+    """The kept folder's archive holds its children, reproducing the original layout."""
     tree = split_into_chunks(tree=oversized_folder, chunk_size=CHUNK, strategy="greedy", merge_ratio=RATIO)
-    cam = next(n for n in zip_nodes(tree) if n.data.path.name == "cam")
+    cam = next(n for n in zip_nodes(tree) if n.data.path.name == "cam.zip")
 
     assert sorted(c.data.path.name for c in cam.children) == ["arguments.json", "binary.npy", "video.mov"]
-    assert cam.data.path == child(child(oversized_folder)).data.path
+    assert [c.data.path.name for c in cam.children] == [
+        c.data.path.name for c in child(child(oversized_folder)).children
+    ]
 
 
 def test_related_field_round_trips(oversized_folder: Tree, tmp_path: Path) -> None:

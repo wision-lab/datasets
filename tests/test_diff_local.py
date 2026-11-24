@@ -154,12 +154,24 @@ def test_member_keys_are_normalized_the_same_on_both_sides(member: str, expected
     A leading `/` or a Windows separator would otherwise produce a key only one side
     recognizes, and every such member would be reported as one-sided.
     """
-    assert _member_key("a/x", member) == expected
+    assert _member_key("a/x", member, strip=("a/x",)) == expected
 
 
 @pytest.mark.parametrize("member", [".", "..", "", "/", "./"])
 def test_a_member_that_normalizes_to_nothing_is_skipped(member: str) -> None:
-    assert _member_key("a/x", member) is None, "filing it would collide with the archive's own key"
+    assert _member_key("a/x", member, strip=("a/x",)) is None, "filing it would collide with the archive's own key"
+
+
+def test_member_key_strips_the_first_matching_prefix() -> None:
+    """A member carrying a prefix from `strip` loses it, so it lines up with a bare name.
+
+    The README's `sync` + `7z x` flow writes members verbatim, so an archive at the
+    prefix root holds `vision/<seq>/<file>` while the local tree is `<seq>/<file>`; the
+    prefix leaf (`vision`) is one of the candidates and must be removed.
+    """
+    assert _member_key("", "vision/0505-bicycle-1/a.npy", strip=("vision",)) == "0505-bicycle-1/a.npy"
+    assert _member_key("sub", "sub/1.jpg", strip=("sub", "vision")) == "sub/1.jpg"
+    assert _member_key("", "unrelated/1.jpg", strip=("vision",)) == "unrelated/1.jpg"
 
 
 def test_a_leading_slash_member_matches_across_both_collectors(tmp_path: Path) -> None:
@@ -175,6 +187,21 @@ def test_a_leading_slash_member_matches_across_both_collectors(tmp_path: Path) -
     source = collect(root)
     target = collect(extracted)
     assert sorted(source) == sorted(target) == ["a/x/1.jpg"]
+
+
+def test_arcnames_that_carry_the_archive_directory_do_not_nest(tmp_path: Path) -> None:
+    """Members already prefixed with the archive's directory map to the same key as bare names.
+
+    A repackaged archive may store `a/x/1.jpg` where `upload` would store `1.jpg`; both
+    describe the same extracted layout, so both must yield `a/x/1.jpg`. Otherwise every
+    member would sit one level too deep (`a/x/a/x/1.jpg`) and match nothing.
+    """
+    root = tmp_path / "src"
+    (root / "a" / "x").mkdir(parents=True)
+    with zipfile.ZipFile(root / "a" / "x" / "part_0.zip", "w") as archive:
+        archive.writestr("a/x/1.jpg", b"image-one")
+
+    assert sorted(collect(root)) == ["a/x/1.jpg"]
 
 
 def test_a_tar_is_expanded_with_no_checksum(tmp_path: Path) -> None:

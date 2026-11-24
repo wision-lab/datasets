@@ -40,6 +40,39 @@ _MD5_ETAG_RE = re.compile(r"^[0-9a-f]{32}$")
 # from the local walk rather than reported as one-sided noise.
 _IGNORED_LOCAL_NAMES = frozenset({".DS_Store", "Thumbs.db"})
 
+# Signatures the first bytes of an archive may carry: zip local-file header and the
+# empty-archive end-of-central-directory record. Used only to recognize a `merge_ratio`
+# folder archive uploaded under a suffix-less key (`upload` names it after the folder).
+_ZIP_MAGIC = (b"PK\x03\x04", b"PK\x05\x06")
+
+
+def _misnamed_archive_keys(*, s3_client: S3Client, bucket: str, keys: list[str]) -> list[str]:
+    """Suffix-less object keys that start with a zip signature.
+
+    A `merge_ratio` folder archive is uploaded under the folder's own key, with no
+    `.zip` suffix, so `archive_suffix` cannot classify it and the diff treats it as a
+    plain file. Reading the first four bytes of each suffix-less candidate recovers the
+    distinction: an object whose body starts with a zip header is an archive a caller
+    should be told to rename. Candidates are probed concurrently; a failed read is
+    ignored so a probe error never aborts the diff.
+    """
+    names: list[str] = []
+
+    def probe(key: str) -> str | None:
+        try:
+            head = s3_client.get_object(Bucket=bucket, Key=key, Range="bytes=0-3")["Body"].read(4)
+        except Exception:  # noqa: BLE001 - a probe failure must not abort the diff
+            return None
+        return key if head.startswith(_ZIP_MAGIC) else None
+
+    if not keys:
+        return names
+    with ThreadPoolExecutor(max_workers=min(8, len(keys))) as executor:
+        for result in executor.map(probe, keys):
+            if result is not None:
+                names.append(result)
+    return sorted(names)
+
 
 @dataclass(frozen=True)
 class Prefix:
@@ -86,6 +119,9 @@ class VirtualTree:
     objects: int = 0
     nested_archives: int = 0
     compressed_archives: int = 0
+    # Full keys of suffix-less objects that are actually archives, so a caller can
+    # tell the user to rename them (see `_misnamed_archive_keys`).
+    misnamed_archives: list[str] = field(default_factory=list)
 
 
 def _differs(a: Fingerprint, b: Fingerprint) -> bool:
@@ -105,8 +141,8 @@ def _differs(a: Fingerprint, b: Fingerprint) -> bool:
     return (a.size, a.checksum) != (b.size, b.checksum)
 
 
-def _member_key(parent: str, member: str) -> str | None:
-    """Virtual key of an archive member, joined onto the archive's parent directory.
+def _member_key(parent: str, member: str, *, strip: tuple[str, ...]) -> str | None:
+    """Virtual key of an archive member, relative to the archive's parent directory.
 
     Shared by the S3 and local collectors so the two sides cannot normalize a member
     differently: `/` separators are unified, and empty, `.` and `..` components, plus a
@@ -114,11 +150,26 @@ def _member_key(parent: str, member: str) -> str | None:
     arcname would otherwise produce keys only one side recognizes, and every such member
     would be reported as present on one side only.
 
+    `strip` is a list of candidate prefixes, in priority order, that an archive's
+    arcnames may carry ahead of the member's path relative to the archive. The README
+    download flow (`sync` the prefix into `downloads/`, then `7z x` each zip in place)
+    writes members verbatim, so an archive holds `<prefix-leaf>/<seq>/<file>`; removing
+    the first matching candidate maps such a member to the same key as a bare name,
+    i.e. `<parent>/<member>`. A member matching no candidate is left alone, which keeps
+    a member legitimately starting with one of those names as its first component.
+
     Returns None for a member that normalizes to nothing (or to the parent directory
     itself), which is a directory-like entry the member lists already skip; keeping it
     would file the member under the archive's own key.
     """
     parts = [part for part in member.replace("\\", "/").split("/") if part not in {"", ".", ".."}]
+    if not parts:
+        return None
+    for candidate in strip:
+        prefix = [part for part in candidate.replace("\\", "/").split("/") if part not in {"", ".", ".."}]
+        if prefix and parts[: len(prefix)] == prefix:
+            parts = parts[len(prefix) :]
+            break
     if not parts:
         return None
     return posixpath.join(parent, *parts)
@@ -149,6 +200,9 @@ def _collect_virtual_files(*, s3_client: S3Client, location: Prefix, workers: in
     """
     objects = list_objects(s3_client=s3_client, bucket=location.bucket, prefix=location.prefix)
     tree = VirtualTree(objects=len(objects))
+    # Last path component of the operand prefix; the README's `sync` + `7z x` flow
+    # lands members under it, so it is a candidate prefix to strip.
+    leaf = posixpath.basename(location.prefix)
 
     suffixes = {key: archive_suffix(key) for key in objects}
     archive_keys = [key for key, suffix in suffixes.items() if suffix in SEEKABLE_ARCHIVE_SUFFIXES]
@@ -183,9 +237,13 @@ def _collect_virtual_files(*, s3_client: S3Client, location: Prefix, workers: in
     for key, manifest in manifests.items():
         kind = "tar" if suffixes[key] == ".tar" else "zip"
         parent = posixpath.dirname(key)
+        # `upload` writes members relative to the partition root, so an archive's
+        # arcnames can carry the archive's directory (`parent`) or the prefix's own
+        # last component ahead of the path; either is stripped before joining.
+        strip = tuple(candidate for candidate in (parent, leaf) if candidate)
         has_nested = False
         for member, (size, crc) in manifest.items():
-            virtual_key = _member_key(parent, member)
+            virtual_key = _member_key(parent, member, strip=strip)
             if virtual_key is None:
                 continue
             if archive_suffix(member) is not None:
@@ -202,6 +260,11 @@ def _collect_virtual_files(*, s3_client: S3Client, location: Prefix, workers: in
             continue
         checksum = obj.etag if _MD5_ETAG_RE.match(obj.etag) else None
         tree.files[key] = Fingerprint(kind="file", size=obj.size, checksum=checksum)
+
+    # A `merge_ratio` folder archive carries no suffix, so it is otherwise filed as one
+    # opaque file. Probe the suffix-less objects so the caller can report them.
+    suffixless = [obj.key for key, obj in objects.items() if suffixes[key] is None and key not in manifests]
+    tree.misnamed_archives = _misnamed_archive_keys(s3_client=s3_client, bucket=location.bucket, keys=suffixless)
 
     return tree
 
@@ -301,7 +364,7 @@ def _collect_local_files(*, path: Path, workers: int) -> VirtualTree:
         parent = posixpath.dirname(relative)
         has_nested = False
         for member, (size, crc) in manifest.items():
-            virtual_key = _member_key(parent, member)
+            virtual_key = _member_key(parent, member, strip=(parent,) if parent else ())
             if virtual_key is None:
                 continue
             tree.files[virtual_key] = Fingerprint(kind=kind, size=size, checksum=None if crc is None else str(crc))
@@ -462,6 +525,25 @@ def diff_s3(
         f"{len(only_target)} only in target, {len(changed)} changed, "
         f"{nested} nested archive(s) skipped, {compressed} compressed archive(s) not expanded."
     )
+
+    # A suffix-less key holding a zip is a `merge_ratio` folder archive from an older
+    # `upload`: it expands to the wrong layout, so report the key and the rename that
+    # gives it the `.zip` suffix the current `upload` writes.
+    misnamed = [
+        (root.bucket, key)
+        for root, tree in ((source_root, source_tree), (target_root, target_tree))
+        if isinstance(root, Prefix)
+        for key in tree.misnamed_archives
+    ]
+    if misnamed:
+        print()
+        log.warning(
+            f"{len(misnamed)} object(s) have no archive suffix but hold a zip; these are "
+            "`merge_ratio` folder archives named by an older `upload` and will not expand. "
+            "Rename each to add `.zip`:"
+        )
+        for bucket_name, key in misnamed:
+            print(f"  aws s3 mv s3://{bucket_name}/{key} s3://{bucket_name}/{key}.zip")
 
     if fail_on_diff and (only_source or only_target or changed):
         raise SystemExit(1)

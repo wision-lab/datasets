@@ -701,8 +701,14 @@ def _split_in_place(
     # Find places for zips without modifying tree topology!
     find_splits(node=root)
 
-    # Turn merges into archives of the node that holds the merged files
+    # Turn merges into archives of the node that holds the merged files. The node
+    # keeps its name so the arcnames written by `upload` (relative to the node's
+    # parent) reproduce the original layout, but takes a `.zip` suffix so the
+    # archive is recognized by its key -- otherwise an archive with no suffix is
+    # indistinguishable from a coarse directory entry.
     for kept_node in kept.values():
+        kept_node.data.path = kept_node.data.path.with_name(f"{kept_node.data.path.name}.zip")
+        kept_node.data.is_dir = False
         kept_node.data.is_zip = True
         # The archive holds the node's children, so the node's size is unchanged.
 

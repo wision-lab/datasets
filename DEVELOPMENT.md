@@ -42,10 +42,10 @@ own, which would otherwise strand its small neighbouring files (videos, masks,
 metadata) in an unrelated archive. `--merge-ratio R` (default `0`, off) folds such
 a folder into the oversized file's archive when its *supporting* files — every
 child except the oversized ones — total at most `R * chunk_size`; the folder itself
-then becomes the archive root, so its contents keep the original layout. Folders
-holding several oversized files keep one archive per oversized file, the
-supporting files riding along with exactly one of them. Nonzero `R` changes archive
-boundaries and therefore S3 object keys.
+then becomes the archive root, named `<folder>.zip`, so its contents keep the
+original layout. Folders holding several oversized files keep one archive per
+oversized file, the supporting files riding along with exactly one of them. Nonzero
+`R` changes archive boundaries and therefore S3 object keys.
 
 ## Tree Metadata
 
